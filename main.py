@@ -1,5 +1,4 @@
 import torch
-from torch import nn
 from universal_attention_autograd import UniversalAttention
 
 def main(config):
@@ -18,7 +17,6 @@ def main(config):
     key_state   = torch.rand(b, s, n_kv, d).to(device)
     value_state = torch.rand(b, s, n_kv, d).to(device)
     static      = torch.rand(b, s, 2 * n_kv).to(device)
-
 
     # Reshape for the kernels
     xq = query_state.transpose(1, 2).view(b, n_kv, rep, s, d)

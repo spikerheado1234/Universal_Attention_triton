@@ -45,6 +45,7 @@ class UniversalAttention(Function):
     @staticmethod
     def backward(ctx, g_out, g_denom):
         # Note: when using mixed precision, g_out is downcast but g_denom is always fp32
+        print(g_out.shape, g_denom.shape)
         kc,vc,xq,static_src,static_dest = ctx.saved_tensors
         dkc,dvc,dxq,dstat_src,dstat_dest = [torch.zeros_like(x) for x in [kc,vc,xq,static_src,static_dest]]
         b,h,r,l,d = xq.shape
