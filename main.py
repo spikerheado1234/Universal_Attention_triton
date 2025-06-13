@@ -36,7 +36,7 @@ def main(config):
     print(output.shape, denom.shape)
 
     # Backward
-    loss = torch.norm(output) + torch.norm(denom) # some random loss to enable autograd
+    loss = torch.sum(output**2) + torch.sum(denom**2) # some random loss to enable autograd
     loss.backward()
     print(output.grad.shape, denom.grad.shape)
 
