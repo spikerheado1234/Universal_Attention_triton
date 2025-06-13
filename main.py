@@ -37,12 +37,12 @@ def main(config):
 
 if __name__ == "__main__":
     test_config = {
-        'batch_size': 64,
-        'seq_len': 4096,
-        'chunk_size': 512,
+        'batch_size': 16,
+        'seq_len': 2048,
+        'chunk_size': 256,
         'n_heads': 32,
         'n_kv_heads': 8,
-        'dim': 4096,
+        'dim': 2048,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     }
 
