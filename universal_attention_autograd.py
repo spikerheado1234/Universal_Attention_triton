@@ -1,6 +1,9 @@
 import torch
 from torch.autograd import Function
 
+# The pytorch autograd version is borrowed from here: 
+# https://github.com/daviswer/torchtitan/blob/sandbox-selfprune-clean-wd/torchtitan/models/llama/utils.py
+
 class UniversalAttention(Function):
     @staticmethod
     def forward(kc, vc, xq, static_src, static_dest):
