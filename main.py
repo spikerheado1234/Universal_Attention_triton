@@ -29,9 +29,17 @@ def main(config):
 
     # Perform universal attention
     UA = UniversalAttention.apply
+
+    # Forward
     output, denom = UA(kc, vc, xq, static_src, static_dest)
 
     print(output.shape, denom.shape)
+
+    # Backward
+    loss = torch.norm(output) + torch.norm(denom) # some random loss to enable autograd
+    loss.backward()
+    print(output.grad.shape, denom.grad.shape)
+
 
 if __name__ == "__main__":
     test_config = {
