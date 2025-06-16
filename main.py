@@ -13,10 +13,10 @@ def main(config):
     n_c     = config['n_chunks']
     device  = config['device']
 
-    query_state = torch.rand(b, s, n, d).to(device)
-    key_state   = torch.rand(b, s, n_kv, d).to(device)
-    value_state = torch.rand(b, s, n_kv, d).to(device)
-    static      = torch.rand(b, s, 2 * n_kv).to(device)
+    query_state = torch.rand(b, s, n, d, device=device, requires_grad=True)
+    key_state   = torch.rand(b, s, n_kv, d, device=device, requires_grad=True)
+    value_state = torch.rand(b, s, n_kv, d, device=device, requires_grad=True)
+    static      = torch.rand(b, s, 2 * n_kv, device=device, requires_grad=True)
 
     # Reshape for the kernels
     xq = query_state.transpose(1, 2).view(b, n_kv, rep, s, d)
@@ -35,9 +35,15 @@ def main(config):
 
     print(output.shape, denom.shape)
 
+    output.retain_grad()
+    denom.retain_grad()
+
     # Backward
     loss = torch.sum(output**2) + torch.sum(denom**2) # some random loss to enable autograd
     loss.backward()
+    assert output.grad.shape == (b, n_kv, rep, s, d, n_c)
+    assert denom.grad.shape == (b, n_kv, rep, s, n_c)
+
     print(output.grad.shape, denom.grad.shape)
 
 
@@ -45,10 +51,10 @@ if __name__ == "__main__":
     test_config = {
         'batch_size': 16,
         'seq_len': 2048,
-        'chunk_size': 256,
+        'chunk_size': 128,
         'n_heads': 32,
         'n_kv_heads': 8,
-        'dim': 2048,
+        'dim': 1024,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     }
 
