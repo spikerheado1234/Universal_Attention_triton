@@ -21,15 +21,19 @@ class UniversalAttention(Function):
             static_src_ = static_src[:,:,i]  # b h c
 
             # Calculate decay matrix
+            print(f"1. {k_.shape}, {kt.shape}")
             affinity = k_.matmul(kt).relu().pow(2/3).float()  # deltanet style decay
+            print(f"2. {affinity.shape}, {static_src_.unsqueeze(-1).shape}, {static_dest.unsqueeze(-2).shape}")
             affinity = affinity * static_src_.unsqueeze(-1) * static_dest.unsqueeze(-2)  # incorporate mamba-style and per-token decay
             affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())  # b h c l
             affinity = affinity.triu(i*c+1).cumsum(3)  # Accumulate decay with causal masking
             affinity = affinity.masked_fill(mask.tril(i*c-1), -1e12)  # Re-mask, with 1s on diagonal
 
             # Perform actual attention operation
+            print(f"3. {k_.unsqueeze(2).shape}, {xq.transpose(-1,-2).shape}, {affinity.unsqueeze(2).shape}")
             score = k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))  # b h r c l
             denom_ = score.logsumexp(dim=-2)  # b h r l
+            print(f"4. {score.transpose(-1,-2).softmax(dim=-1).to(dtype=xq.dtype).shape}, {v_.unsqueeze(2).shape}")
             out_ = score.transpose(-1,-2).softmax(dim=-1).to(dtype=xq.dtype).matmul(v_.unsqueeze(2))  # b h r l d
 
             out[...,i] = out_
