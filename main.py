@@ -43,25 +43,25 @@ def main(config):
 
 
 if __name__ == "__main__":
-    # test_config = {
-    #     'batch_size': 16,
-    #     'seq_len': 2048,
-    #     'chunk_size': 128,
-    #     'n_heads': 32,
-    #     'n_kv_heads': 8,
-    #     'dim': 1024,
-    #     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-    # }
-
     test_config = {
-        'batch_size': 2,
-        'seq_len': 16,
-        'chunk_size': 4,
-        'n_heads': 2,
-        'n_kv_heads': 1,
-        'dim': 8,
+        'batch_size': 16,
+        'seq_len': 2048,
+        'chunk_size': 128,
+        'n_heads': 32,
+        'n_kv_heads': 8,
+        'dim': 1024,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     }
+
+    # test_config = {
+    #     'batch_size': 2,
+    #     'seq_len': 16,
+    #     'chunk_size': 4,
+    #     'n_heads': 2,
+    #     'n_kv_heads': 1,
+    #     'dim': 8,
+    #     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+    # }
 
     test_config['n_rep'] = test_config['n_heads'] // test_config['n_kv_heads']
     test_config['head_dim'] = test_config['dim'] // test_config['n_heads']
