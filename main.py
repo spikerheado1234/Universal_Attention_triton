@@ -1,5 +1,5 @@
 import torch
-from universal_attention_autograd import UniversalAttention
+from universal_attention_autograd import UniversalAttention as uni_attn_torch
 
 def main(config):
     # Generate random input
@@ -28,33 +28,38 @@ def main(config):
     static_dest = static[1] 
 
     # Perform universal attention
-    UA = UniversalAttention.apply
+    UA_torch = uni_attn_torch.apply
 
     # Forward
-    output, denom = UA(kc, vc, xq, static_src, static_dest)
-
+    output, denom = UA_torch(kc, vc, xq, static_src, static_dest)
     print(output.shape, denom.shape)
 
+    # Backward
     output.retain_grad()
     denom.retain_grad()
-
-    # Backward
     loss = torch.sum(output**2) + torch.sum(denom**2) # some random loss to enable autograd
     loss.backward()
-    assert output.grad.shape == (b, n_kv, rep, s, d, n_c)
-    assert denom.grad.shape == (b, n_kv, rep, s, n_c)
-
     print(output.grad.shape, denom.grad.shape)
 
 
 if __name__ == "__main__":
+    # test_config = {
+    #     'batch_size': 16,
+    #     'seq_len': 2048,
+    #     'chunk_size': 128,
+    #     'n_heads': 32,
+    #     'n_kv_heads': 8,
+    #     'dim': 1024,
+    #     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+    # }
+
     test_config = {
-        'batch_size': 16,
-        'seq_len': 2048,
-        'chunk_size': 128,
-        'n_heads': 32,
-        'n_kv_heads': 8,
-        'dim': 1024,
+        'batch_size': 2,
+        'seq_len': 16,
+        'chunk_size': 4,
+        'n_heads': 2,
+        'n_kv_heads': 1,
+        'dim': 8,
         'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     }
 

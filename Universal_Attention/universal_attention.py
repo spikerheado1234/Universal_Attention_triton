@@ -46,5 +46,5 @@ class UniversalAttention(Function):
         if ddenom.stride(-1) != 1:
             ddenom = ddenom.contiguous()
         dkc, dvc, dxq, dstatic_src, dstatic_dest = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
-        # TODO: Handle datatype
+        # TODO: Handle datatype/precision conversion
         return dkc, dvc, dxq, dstatic_src, dstatic_dest

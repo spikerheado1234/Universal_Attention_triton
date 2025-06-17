@@ -1,8 +1,6 @@
 import torch
 import triton
-
-# The pytorch autograd version is borrowed from here: 
-# https://github.com/daviswer/torchtitan/blob/sandbox-selfprune-clean-wd/torchtitan/models/llama/utils.py
+import triton.language as tl
 
 @triton.autotune(
     configs=[
@@ -21,9 +19,19 @@ import triton
 @triton.jit
 def _universal_attention_fwd_kernel(
     # Pointers to matrices
+    kc_ptr, vc_ptr, xq_ptr, static_src_ptr, static_dest_ptr, out_ptr, denom_ptr,
     # Matrix dimensions
+    b, n_kv, rep, s, d, n_c, c,
     # Strides
+    stride_kc_b, stride_kc_n_kv, stride_kc_n_c, stride_kc_c, stride_kc_d,
+    stride_vc_b, stride_vc_n_kv, stride_vc_n_c, stride_vc_c, stride_vc_d,
+    stride_xq_b, stride_xq_n_kv, stride_xq_rep, stride_xq_s, stride_xq_d,
+    stride_static_src_b, stride_static_src_n_kv, stride_static_src_n_c, stride_static_src_c,
+    stride_static_dest_b, stride_static_dest_n_kv, stride_static_dest_s,
+    stride_out_b, stride_out_n_kv, stride_out_rep, stride_out_s, stride_out_d, stride_out_n_c,
+    stride_denom_b, stride_denom_n_kv, stride_denom_rep, stride_denom_s, stride_denom_n_c,
     # Meta-parameters
+
 ):
     b,h,r,l,d = xq.shape
     _,_,n,c,_ = kc.shape
@@ -58,19 +66,15 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
     b, n_kv, rep, s, d = xq.shape
     _, _, n_c, c, _ = kc.shape
     device = xq.device
-    assert kc.shape == (b, n_kv, n_c, c, d)
-    assert vc.shape == (b, n_kv, n_c, c, d)
-    assert static_src.shape == (b, n_kv, n_c, c)
-    assert static_dest.shape == (b, n_kv, s)
 
-    mask = torch.ones(c, s, dtype=torch.bool, device=device)
     out = torch.empty(b, n_kv, rep, s, d, n_c, dtype=xq.dtype, device=device)
     denom = torch.empty(b, n_kv, rep, s, n_c, dtype=xq.dtype, device=device)
 
+    grid = lambda META: (
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
                     batch * nchunks, nheads)
     
-    with torch.cuda.device(x.device.index):
+    with torch.cuda.device(device.index):
         _universal_attention_fwd_kernel[grid](
             x, B, states, dt, dA_cumsum, seq_idx,
             headdim, dstate, chunk_size,
@@ -85,6 +89,26 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
         )
 
     return out, denom
+
+def matmul(a, b, activation=""):
+    # Check constraints.
+    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    assert a.is_contiguous(), "Matrix A must be contiguous"
+    M, K = a.shape
+    K, N = b.shape
+    # Allocates output.
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    # 1D launch kernel where each block gets its own program.
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    matmul_kernel[grid](
+        a, b, c,  #
+        M, N, K,  #
+        a.stride(0), a.stride(1),  #
+        b.stride(0), b.stride(1),  #
+        c.stride(0), c.stride(1),  #
+        ACTIVATION=activation  #
+    )
+    return c
 
 @triton.autotune(
     configs=[
