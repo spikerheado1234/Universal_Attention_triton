@@ -34,6 +34,7 @@ def main(config):
         # "triton": uni_attn_triton.apply,
     }
     SMVMM = SMVecMatMul.apply
+
     results = {}
 
     for key in UA_impl.keys():
@@ -55,8 +56,7 @@ def main(config):
         # Backward
         output.retain_grad()
         denom.retain_grad()
-        # loss = output.pow(2).sum() + denom.exp().pow(2).sum() # some random loss to enable autograd
-        loss = out.pow(2).sum()
+        loss = out.pow(2).sum() # some random loss to enable autograd
         loss.backward()
 
         if key == "pytorch_chunked":

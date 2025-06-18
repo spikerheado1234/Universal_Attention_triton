@@ -65,12 +65,10 @@ def matmul_4d_kernel(
 
 def efficient_4d_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     assert A.ndim == 4 and B.ndim == 4, "Inputs must be 4-D"
-    assert A.shape[-1] == B.shape[-2], "Dimension mismatch!"
-    assert A.device.type == 'cuda', "This implementation requires CUDA tensors"
+    assert A.shape[-1] == B.shape[-2], "Dimension mismatch"
 
     b, n_kv, m, k = A.shape
     _, _, _, n = B.shape
-    torch.cuda.set_device(A.device)
 
     if A.stride(-1) != 1:
         A = A.contiguous()

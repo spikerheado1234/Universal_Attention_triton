@@ -4,92 +4,95 @@ import torch
 import time
 import math
 
-# Phase 1: compute total sum of each chunk
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
+    ],
+    key=['m', 'k', 'n'],
+)
 @triton.jit
-def _chunk_sum_kernel(input_ptr,      # pointer to input[0…L)
-                      chunk_sums_ptr, # pointer to chunk_sums[0…num_chunks)
-                      L: tl.constexpr,      # total length
-                      chunk_size: tl.constexpr,  # size of each chunk
-                      stride: tl.constexpr  # element stride (usually 1)
-                      ):
-    chunk_id = tl.program_id(0)
-    start = chunk_id * chunk_size
-    # actual elements in this chunk
-    n = tl.minimum(chunk_size, L - start)
-    sum_val = tl.float32(0.0)
-    # simple serial reduction over up to chunk_size elements
-    for i in range(0, n):
-        sum_val += tl.load(input_ptr + (start + i) * stride)
-    tl.store(chunk_sums_ptr + chunk_id, sum_val)
+def cumsum_kernel(
+    A_ptr, A_cs_ptr,
+    b, n_kv, m, n, 
+    stride_ab, stride_an_kv, stride_am, stride_an,
+    stride_acsb, stride_acsn_kv, stride_acsm, stride_acsn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_b_n_kv = tl.program_id(0)
+    pid_b = pid_b_n_kv // n_kv
+    pid_n_kv = pid_b_n_kv % n_kv
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
 
-# Phase 3: do the chunked cumsum with tl.cumsum + add offset
-@triton.jit
-def _chunked_cumsum_kernel(input_ptr,
-                           output_ptr,
-                           chunk_offsets_ptr,  # exclusive-scan of chunk_sums
-                           L: tl.constexpr,
-                           chunk_size: tl.constexpr,
-                           stride: tl.constexpr):
-    chunk_id = tl.program_id(0)
-    start = chunk_id * chunk_size
-    n = tl.minimum(chunk_size, L - start)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    # load up to chunk_size elements (pad with zero)
-    offs = start + tl.arange(0, chunk_size)
-    x = tl.load(input_ptr + offs * stride, mask=offs < L, other=0.0)
+    A_ptr += pid_b * stride_ab + pid_n_kv * stride_an_kv
+    A_cs_ptr += pid_b * stride_acsb + pid_n_kv * stride_acsn_kv
 
-    # 1) local inclusive scan across the chunk
-    y = tl.cumsum(x, axis=0)
-
-    # 2) add the precomputed offset for this chunk
-    base = tl.load(chunk_offsets_ptr + chunk_id)
-    y = y + base
-
-    # 3) write back only the real elements
-    tl.store(output_ptr + offs * stride, y, mask=offs < L)
-
-# Host‐side driver to glue it all together
-def chunked_cumsum_triton(x: torch.Tensor, chunk_size: int):
-    """
-    Compute y = cumsum(x) in chunks of size `chunk_size` using Triton.
-    """
-    assert x.ndim == 1, "1D example; extend to 2D by flattening rows."
-    L = x.shape[0]
-    num_chunks = math.ceil(L / chunk_size)
-
-    # buffers on device
-    chunk_sums   = torch.empty((num_chunks,), device=x.device, dtype=torch.float32)
-    chunk_offsets = torch.empty_like(chunk_sums)
-    y = torch.empty_like(x)
-
-    # Phase 1: compute each chunk's total
-    _chunk_sum_kernel[(num_chunks,)](
-        x, chunk_sums,
-        L, chunk_size, 1,
-        num_warps=4,
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    A_mat = tl.load(
+        A_ptr + offs_m[:, None] * stride_am + offs_n[None, :] * stride_an,
+        mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
+        other=0.0,
     )
 
-    # Phase 2: exclusive scan on host
-    #   offsets[0] = 0, offsets[i] = sum(chunk_sums[:i])
-    cs = chunk_sums.cpu().numpy()
-    offs = cs.cumsum()
-    chunk_offsets_cpu = torch.from_numpy(
-        np.concatenate(([0.0], offs[:-1]), axis=0)
-    )
-    chunk_offsets.copy_(chunk_offsets_cpu.to(x.device))
+    acc = tl.cumsum(A_mat, axis=-1)
 
-    # Phase 3: chunked cumsum + add offsets
-    _chunked_cumsum_kernel[(num_chunks,)](
-        x, y, chunk_offsets,
-        L, chunk_size, 1,
-        num_warps=4,
+    tl.store(
+        A_cs_ptr + offs_m[:, None] * stride_acsm + offs_n[None, :] * stride_acsn,
+        acc,
+        mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
     )
-    return y
+
+def efficient_cumsum(A: torch.Tensor) -> torch.Tensor:
+    assert A.device.type == 'cuda', "This implementation requires CUDA tensors"
+
+    b, n_kv, m, n = A.shape
+    torch.cuda.set_device(A.device)
+
+    if A.stride(-1) != 1:
+        A = A.contiguous()
+
+    A_cs = torch.empty((b, n_kv, m, n), device=A.device, dtype=A.dtype)
+
+    grid = lambda META: (b * n_kv, triton.cdiv(m, META['BLOCK_M']), triton.cdiv(n, META['BLOCK_N']))
+
+    cumsum_kernel[grid](
+        A, A_cs,
+        b, n_kv, m, n, 
+        A.stride(0), A.stride(1), A.stride(2), A.stride(3),
+        A_cs.stride(0), A_cs.stride(1), A_cs.stride(2), A_cs.stride(3),
+    )
+        
+    return A_cs
 
 if __name__ == "__main__":
-    x = torch.arange(1, 10, device='cuda', dtype=torch.float32)  # [1…9]
-    y = chunked_cumsum_triton(x, chunk_size=3)
-    # should be [1,2,3,4,5,6,7,8,9]
-    print(y)  
-    # verify
-    assert torch.allclose(y, x.cumsum(dim=0))
+    # b, n_kv, m, n = 2, 4, 128, 256
+    # A = torch.randn(b, n_kv, m, n, device='cuda', dtype=torch.float16)
+    A = torch.arange(1, 10, device='cuda', dtype=torch.float32).view(1, 1, 1, -1)
+
+    _ = efficient_cumsum(A)
+    torch.cuda.synchronize()
+
+    start_time = time.time()
+    A_cs = efficient_cumsum(A)
+    print(f"Pytorch kernel time: {time.time() - start_time}")
+
+    start_time = time.time()
+    A_cs_ref = torch.cumsum(A, dim=-1)
+    print(f"Pytorch kernel time: {time.time() - start_time}")
+
+    print("Max error:", (A_cs.float() - A_cs_ref.float()).abs().max())
+
+
