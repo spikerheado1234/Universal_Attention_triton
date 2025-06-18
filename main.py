@@ -81,7 +81,7 @@ def main(config):
         r = []
         for key in results.keys():
             r.append(results[key][attr])
-        print(f"{attr} max error:", (r[0].float() - r[1].float()).abs().max())
+        print(f"{attr} max error:", (r[0].float() - r[1].float()).abs().max().item())
 
 if __name__ == "__main__":
     test_config = {
