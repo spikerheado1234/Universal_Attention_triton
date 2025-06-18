@@ -124,8 +124,8 @@ class UniversalAttention2(Function):
         _,_,n_,c_,_ = kc.shape
         l = n_ * c_
         mask = torch.ones(c_,_c, dtype=torch.bool, device=xq.device)
-        out = torch.empty(b,h,r,l,d,n, dtype=xq.dtype, device=xq.device)
-        denom = torch.empty(b,h,r,l,n, dtype=xq.dtype, device=xq.device)
+        out = torch.empty(b,h,r,l,d,n_, dtype=xq.dtype, device=xq.device)
+        denom = torch.empty(b,h,r,l,n_, dtype=xq.dtype, device=xq.device)
         static_src = static_src.pow(1/3)
         static_dest = static_dest.pow(1/3)
         kt = kc.view(b,h,_n,_c,d).permute(0,1,4,2,3)  # b h d _n _c
