@@ -35,16 +35,16 @@ def main(config):
     results = {}
 
     for key in UA_impl.keys():
-        kc_          = kc.clone().to(device).requires_grad_()
-        vc_          = vc.clone().to(device).requires_grad_()
-        static_src_  = static_src.clone().to(device).requires_grad_()
+        kc_          = kc.clone().detach().to(device).requires_grad_()
+        vc_          = vc.clone().detach().to(device).requires_grad_()
+        static_src_  = static_src.clone().detach().to(device).requires_grad_()
 
         if key == "pytorch_chunked":
-            xq_ = xq.view(b, n_kv, rep, n_c, c, d).clone().to(device).requires_grad_()
-            static_dest_ = static_dest.view(b, n_kv, n_c, c).clone().to(device).requires_grad_()
+            xq_ = xq.view(b, n_kv, rep, n_c, c, d).clone().detach().to(device).requires_grad_()
+            static_dest_ = static_dest.view(b, n_kv, n_c, c).clone().detach().to(device).requires_grad_()
         else:
-            xq_ = xq.clone().to(device).requires_grad_()
-            static_dest_ = static_dest.clone().to(device).requires_grad_()
+            xq_ = xq.clone().detach().to(device).requires_grad_()
+            static_dest_ = static_dest.clone().detach().to(device).requires_grad_()
         
         # Forward
         output, denom = UA_impl[key](kc_, vc_, xq_, static_src_, static_dest_)
