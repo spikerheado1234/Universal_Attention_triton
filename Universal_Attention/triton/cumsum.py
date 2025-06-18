@@ -18,7 +18,7 @@ import math
         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=2),
     ],
-    key=['m', 'k', 'n'],
+    key=['m', 'n'],
 )
 @triton.jit
 def cumsum_kernel(
