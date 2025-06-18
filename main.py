@@ -55,23 +55,34 @@ def main(config):
         loss = output.pow(2).sum() + denom.pow(2).sum() # some random loss to enable autograd
         loss.backward()
 
+        if key == "pytorch_chunked":
+            xq_grad = xq_.grad.view(b, n_kv, rep, s, d).clone().detach().cpu()
+            static_dest_grad = static_dest_.grad.view(b, n_kv, s).clone().detach().cpu()
+        else:
+            xq_grad = xq_.grad.clone().detach().cpu()
+            static_dest_grad = static_dest_.grad.clone().detach().cpu()
+
         results[key] = {
             'output': output.clone().detach().cpu(),
             'denom': denom.clone().detach().cpu(),
             'kc.grad': kc_.grad.clone().detach().cpu(),
             'vc.grad': vc_.grad.clone().detach().cpu(),
-            'xq.grad': xq_.grad.clone().detach().cpu(),
+            'xq.grad': xq_grad,
             'static_src.grad': static_src_.grad.clone().detach().cpu(),
-            'static_dest.grad': static_dest_.grad.clone().detach().cpu(),
+            'static_dest.grad': static_dest_grad,
         }
-        del output, denom, kc_, vc_, xq_, static_src_, static_dest_
+
+        del output, denom, kc_, vc_, xq_, static_src_, static_dest_, xq_grad, static_dest_grad
 
     # Compare results
-    print("Check shapes:")
-    for key in results.keys():
-        print(key)
-        for k in results[key].keys():
-            print(k, results[key][k].shape)
+    print("Check results:")
+    for attr in ['output', 'denom', 'kc.grad', 'vc.grad', 'xq.grad',
+            'static_src.grad', 'static_dest.grad']:
+        print(attr)
+        r = []
+        for key in results.keys():
+            r.append(results[key][attr])
+        print(f"{attr} max error:", (r[0].float() - r[1].float()).abs().max())
 
 if __name__ == "__main__":
     test_config = {
