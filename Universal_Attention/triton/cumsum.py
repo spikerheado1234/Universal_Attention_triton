@@ -87,7 +87,8 @@ if __name__ == "__main__":
 
     start_time = time.time()
     A_cs = efficient_cumsum(A)
-    print(f"Pytorch kernel time: {time.time() - start_time}")
+    print(f"Triton kernel time: {time.time() - start_time}")
+    print(A_cs)
 
     start_time = time.time()
     A_cs_ref = torch.cumsum(A, dim=-1)
