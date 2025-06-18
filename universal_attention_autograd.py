@@ -273,3 +273,24 @@ class UniversalAttention2(Function):
                 dkc = dkc.view(b,h,n_,c_,d)
 
         return dkc,dvc,dxq,dstat_src,dstat_dest
+    
+class SMVecMatMul(Function):
+    @staticmethod
+    def forward(mat, vec):
+        # mat: ... d n
+        # vec: ... n
+        return mat.mul(vec.softmax(dim=-1).unsqueeze(-2)).sum(-1)
+
+    @staticmethod
+    def setup_context(ctx, inputs, outputs):
+        mat, vec = inputs
+        ctx.save_for_backward(mat, vec)
+
+    @ staticmethod
+    def backward(ctx, g):
+        mat, vec = ctx.saved_tensors
+        vec = vec.softmax(dim=-1)
+        d_mat = g.unsqueeze(-1).mul(vec.unsqueeze(-2))  # ... d n
+        d_vec = g.unsqueeze(-1).mul(mat).sum(-2)  # ... n
+        d_vec = d_vec.sub(d_vec.mul(vec).sum(-1,True)).mul(vec)
+        return d_mat, d_vec

@@ -1,6 +1,7 @@
 import torch
 from universal_attention_autograd import UniversalAttention as uni_attn_torch
 from universal_attention_autograd import UniversalAttention2 as uni_attn_torch_2
+from universal_attention_autograd import SMVecMatMul
 
 def main(config):
     b       = config['batch_size']
@@ -32,6 +33,7 @@ def main(config):
         "pytorch_chunked": uni_attn_torch_2.apply,
         # "triton": uni_attn_triton.apply,
     }
+    SMVMM = SMVecMatMul.apply
     results = {}
 
     for key in UA_impl.keys():
@@ -48,11 +50,13 @@ def main(config):
         
         # Forward
         output, denom = UA_impl[key](kc_, vc_, xq_, static_src_, static_dest_)
+        out = SMVMM(output, denom)
 
         # Backward
         output.retain_grad()
         denom.retain_grad()
-        loss = output.pow(2).sum() + denom.exp().pow(2).sum() # some random loss to enable autograd
+        # loss = output.pow(2).sum() + denom.exp().pow(2).sum() # some random loss to enable autograd
+        loss = out.pow(2).sum()
         loss.backward()
 
         if key == "pytorch_chunked":
