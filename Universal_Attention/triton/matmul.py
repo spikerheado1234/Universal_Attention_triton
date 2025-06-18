@@ -3,61 +3,6 @@ import triton.language as tl
 import torch
 import time
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32, 'BLOCK_K': 16}, num_stages=2, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 16}, num_stages=2, num_warps=8),
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 16}, num_stages=2, num_warps=16),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
-#     ],
-#     key=['S', 'D'],
-# )
-# @triton.jit
-# def matmul_4d_kernel(
-#     A_ptr, B_ptr, C_ptr,
-#     BATCH, S, D,
-#     stride_ab, stride_as, stride_ad,
-#     stride_bb, stride_bd, stride_bs,
-#     stride_cb, stride_cs, stride_cn,
-#     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-# ):
-#     # program axes
-#     pid_batch = tl.program_id(0)
-#     pid_m     = tl.program_id(1)
-#     pid_n     = tl.program_id(2)
-
-#     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-#     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-#     A_ptr += pid_batch * stride_ab
-#     B_ptr += pid_batch * stride_bb
-#     C_ptr += pid_batch * stride_cb
-
-#     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-#     for k_offset in range(0, D, BLOCK_K):
-#         offs_k = k_offset + tl.arange(0, BLOCK_K)
-#         a_ptrs = A_ptr + offs_m[:, None] * stride_as + offs_k[None, :] * stride_ad
-#         a = tl.load(
-#             a_ptrs,
-#             mask=(offs_m[:, None] < S) & (offs_k[None, :] < D),
-#             other=0.0,
-#         )
-#         b_ptrs = B_ptr + offs_k[:, None] * stride_bd + offs_n[None, :] * stride_bs
-#         b = tl.load(
-#             b_ptrs,
-#             mask=(offs_k[:, None] < D) & (offs_n[None, :] < S),
-#             other=0.0,
-#         )
-#         acc += tl.dot(a, b)
-
-#     c_ptrs = C_ptr + offs_m[:, None] * stride_cs + offs_n[None, :] * stride_cn
-#     tl.store(
-#         c_ptrs,
-#         acc,
-#         mask=(offs_m[:, None] < S) & (offs_n[None, :] < S),
-#     )
-
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64}, num_stages=3, num_warps=8),
@@ -83,7 +28,6 @@ def matmul_4d_kernel(
     stride_cb, stride_cn_kv, stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
-    # program axes
     pid_b_n_kv = tl.program_id(0)
     pid_b = pid_b_n_kv // n_kv
     pid_n_kv = pid_b_n_kv % n_kv
@@ -121,39 +65,31 @@ def matmul_4d_kernel(
 
 def efficient_4d_matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     assert A.ndim == 4 and B.ndim == 4, "Inputs must be 4-D"
+    assert A.shape[-1] == B.shape[-2], "Dimension mismatch!"
+    assert A.device.type == 'cuda', "This implementation requires CUDA tensors"
+
     b, n_kv, m, k = A.shape
     _, _, _, n = B.shape
-    assert A.shape[-1] == B.shape[-2], "Dimension miss match!"
+    torch.cuda.set_device(A.device)
 
-    # A_flat = A.contiguous().view(-1, S, D)
-    # B_flat = B.contiguous().view(-1, D, S)
-    # C_flat = torch.empty((b * n_kv, S, S), device=A.device, dtype=A.dtype)
+    if A.stride(-1) != 1:
+        A = A.contiguous()
+    if A.device != B.device:
+        B = B.to(A.device)
+    if B.stride(-1) != 1:
+        B = B.contiguous()
 
-    A = A.contiguous()
-    B = B.contiguous()
     C = torch.empty((b, n_kv, m, n), device=A.device, dtype=A.dtype)
 
     grid = lambda META: (b * n_kv, triton.cdiv(m, META['BLOCK_M']), triton.cdiv(n, META['BLOCK_N']))
 
-    # with torch.cuda.device('cuda'):
-    #     matmul_4d_kernel[grid](
-    #         A_flat, B_flat, C_flat,
-    #         b * n_kv, S, D,
-    #         A_flat.stride(0), A_flat.stride(1), A_flat.stride(2),
-    #         B_flat.stride(0), B_flat.stride(1), B_flat.stride(2),
-    #         C_flat.stride(0), C_flat.stride(1), C_flat.stride(2),
-    #     )
-        
-    # return C_flat.view(b, n_kv, S, S)
-    
-    with torch.cuda.device('cuda'):
-        matmul_4d_kernel[grid](
-            A, B, C,
-            b, n_kv, m, k, n, 
-            A.stride(0), A.stride(1), A.stride(2), A.stride(3),
-            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
-            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
-        )
+    matmul_4d_kernel[grid](
+        A, B, C,
+        b, n_kv, m, k, n, 
+        A.stride(0), A.stride(1), A.stride(2), A.stride(3),
+        B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+        C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+    )
         
     return C
 
