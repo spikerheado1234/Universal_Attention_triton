@@ -78,7 +78,6 @@ def main(config):
     print("Check results:")
     for attr in ['output', 'denom', 'kc.grad', 'vc.grad', 'xq.grad',
             'static_src.grad', 'static_dest.grad']:
-        print(attr)
         r = []
         for key in results.keys():
             r.append(results[key][attr])
