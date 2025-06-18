@@ -1,8 +1,8 @@
 import torch
 from universal_attention_autograd import UniversalAttention as uni_attn_torch
+from universal_attention_autograd import UniversalAttention2 as uni_attn_torch_2
 
 def main(config):
-    # Generate random input
     b       = config['batch_size']
     s       = config['seq_len']
     n       = config['n_heads']
@@ -13,10 +13,10 @@ def main(config):
     n_c     = config['n_chunks']
     device  = config['device']
 
-    query_state = torch.rand(b, s, n, d, device=device, requires_grad=True)
-    key_state   = torch.rand(b, s, n_kv, d, device=device, requires_grad=True)
-    value_state = torch.rand(b, s, n_kv, d, device=device, requires_grad=True)
-    static      = torch.rand(b, s, 2 * n_kv, device=device, requires_grad=True)
+    query_state = torch.rand(b, s, n, d, device=device)
+    key_state   = torch.rand(b, s, n_kv, d, device=device)
+    value_state = torch.rand(b, s, n_kv, d, device=device)
+    static      = torch.rand(b, s, 2 * n_kv, device=device)
 
     # Reshape for the kernels
     xq = query_state.transpose(1, 2).view(b, n_kv, rep, s, d)
@@ -27,20 +27,51 @@ def main(config):
     static_src = static[0].view(b, n_kv, n_c, c)
     static_dest = static[1] 
 
-    # Perform universal attention
-    UA_torch = uni_attn_torch.apply
+    UA_impl = {
+        "pytorch_base": uni_attn_torch.apply,
+        "pytorch_chunked": uni_attn_torch_2.apply,
+        # "triton": uni_attn_triton.apply,
+    }
+    results = {}
+    output_list, denom_list, output_grad_list, denom_grad_list = [], [], [], []
 
-    # Forward
-    output, denom = UA_torch(kc, vc, xq, static_src, static_dest)
-    print(output.shape, denom.shape)
+    for key, UA in UA_impl:
+        kc_          = kc.clone().to(device).requires_grad_()
+        vc_          = vc.clone().to(device).requires_grad_()
+        xq_          = xq.clone().to(device).requires_grad_()
+        static_src_  = static_src.clone().to(device).requires_grad_()
+        static_dest_ = static_dest.clone().to(device).requires_grad_()
 
-    # Backward
-    output.retain_grad()
-    denom.retain_grad()
-    loss = torch.sum(output**2) + torch.sum(denom**2) # some random loss to enable autograd
-    loss.backward()
-    print(output.grad.shape, denom.grad.shape)
+        if key == "pytorch_chunked":
+            xq_ = xq_.view(b, n_kv, rep, n_c, c, d)
+            static_dest_ = static_dest_.view(b, n_kv, n_c, c)
+        
+        # Forward
+        output, denom = UA(kc_, vc_, xq_, static_src_, static_dest_)
 
+        # Backward
+        output.retain_grad()
+        denom.retain_grad()
+        loss = output.pow(2).sum() + denom.pow(2).sum() # some random loss to enable autograd
+        loss.backward()
+
+        results[key] = {
+            'output': output.clone().detach().cpu(),
+            'denom': denom.clone().detach().cpu(),
+            'kc.grad': kc_.grad.clone().detach().cpu(),
+            'vc.grad': vc_.grad.clone().detach().cpu(),
+            'xq.grad': xq_.grad.clone().detach().cpu(),
+            'static_src.grad': static_src_.grad.clone().detach().cpu(),
+            'static_dest.grad': static_dest_.grad.clone().detach().cpu(),
+        }
+        del output, denom, kc_, vc_, xq_, static_src_, static_dest_
+
+    # Compare results
+    print("Check shapes:")
+    for key, result in results:
+        print(key)
+        for k, t in result:
+            print(k, t.shape)
 
 if __name__ == "__main__":
     test_config = {
