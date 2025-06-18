@@ -33,9 +33,8 @@ def main(config):
         # "triton": uni_attn_triton.apply,
     }
     results = {}
-    output_list, denom_list, output_grad_list, denom_grad_list = [], [], [], []
 
-    for key, UA in UA_impl:
+    for key in UA_impl.keys():
         kc_          = kc.clone().to(device).requires_grad_()
         vc_          = vc.clone().to(device).requires_grad_()
         xq_          = xq.clone().to(device).requires_grad_()
@@ -47,7 +46,7 @@ def main(config):
             static_dest_ = static_dest_.view(b, n_kv, n_c, c)
         
         # Forward
-        output, denom = UA(kc_, vc_, xq_, static_src_, static_dest_)
+        output, denom = UA_impl[key](kc_, vc_, xq_, static_src_, static_dest_)
 
         # Backward
         output.retain_grad()
@@ -68,10 +67,10 @@ def main(config):
 
     # Compare results
     print("Check shapes:")
-    for key, result in results:
+    for key in results.keys():
         print(key)
-        for k, t in result:
-            print(k, t.shape)
+        for k in results[key].keys():
+            print(k, results[key][k].shape)
 
 if __name__ == "__main__":
     test_config = {
