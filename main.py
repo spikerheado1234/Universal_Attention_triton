@@ -52,7 +52,7 @@ def main(config):
         # Backward
         output.retain_grad()
         denom.retain_grad()
-        loss = output.pow(2).sum() + denom.pow(2).sum() # some random loss to enable autograd
+        loss = output.pow(2).sum() + denom.exp().pow(2).sum() # some random loss to enable autograd
         loss.backward()
 
         if key == "pytorch_chunked":
