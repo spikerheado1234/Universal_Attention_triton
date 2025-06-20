@@ -22,10 +22,11 @@ import math
 )
 @triton.jit
 def cumsum_kernel(
-    A_ptr, A_cs_ptr,
+    A_ptr, A_cs_ptr, sem_ptr,
     b, n_kv, m, n, 
     stride_ab, stride_an_kv, stride_am, stride_an,
     stride_acsb, stride_acsn_kv, stride_acsm, stride_acsn,
+    stride_semab, stride_seman_kv, stride_semam, 
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_b_n_kv = tl.program_id(0)
@@ -34,11 +35,19 @@ def cumsum_kernel(
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(2)
 
+    # grid_size_0 = tl.num_programs(0)
+    # grid_size_1 = tl.num_programs(1)
+    # Assume that this dimension of the grid chunks the dimension that needs cumsum
+    grid_size_2 = tl.num_programs(2) 
+
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     A_ptr += pid_b * stride_ab + pid_n_kv * stride_an_kv
     A_cs_ptr += pid_b * stride_acsb + pid_n_kv * stride_acsn_kv
+    # The ptr offset should be the same as A's
+    sem_ptr += pid_b * stride_semab + pid_n_kv * stride_seman_kv 
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     A_mat = tl.load(
@@ -49,11 +58,25 @@ def cumsum_kernel(
 
     acc = tl.cumsum(A_mat, axis=-1)
 
+    while tl.atomic_add(sem_ptr, 0) < pid_n:
+      pass
+
+    if pid_n > 0:
+        prev_sum = tl.load(
+            A_cs_ptr + offs_m * stride_acsm + (pid_n * BLOCK_N - 1) * stride_acsn, 
+            mask=offs_m < m, 
+            other=0.0
+        ) 
+        acc = acc + prev_sum[:, None]
+
     tl.store(
         A_cs_ptr + offs_m[:, None] * stride_acsm + offs_n[None, :] * stride_acsn,
         acc,
         mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
     )
+
+    tl.atomic_add(sem_ptr, 1)
+
 
 def efficient_cumsum(A: torch.Tensor) -> torch.Tensor:
     assert A.device.type == 'cuda', "This implementation requires CUDA tensors"
@@ -65,22 +88,24 @@ def efficient_cumsum(A: torch.Tensor) -> torch.Tensor:
         A = A.contiguous()
 
     A_cs = torch.empty((b, n_kv, m, n), device=A.device, dtype=A.dtype)
+    semaphore = torch.zeros(b, n_kv, m, device=A.device, dtype=torch.int32)
 
     grid = lambda META: (b * n_kv, triton.cdiv(m, META['BLOCK_M']), triton.cdiv(n, META['BLOCK_N']))
 
     cumsum_kernel[grid](
-        A, A_cs,
+        A, A_cs, semaphore,
         b, n_kv, m, n, 
         A.stride(0), A.stride(1), A.stride(2), A.stride(3),
         A_cs.stride(0), A_cs.stride(1), A_cs.stride(2), A_cs.stride(3),
+        semaphore.stride(0), semaphore.stride(1), semaphore.stride(2), 
     )
         
     return A_cs
 
 if __name__ == "__main__":
-    # b, n_kv, m, n = 2, 4, 128, 256
-    # A = torch.randn(b, n_kv, m, n, device='cuda', dtype=torch.float16)
-    A = torch.arange(1, 10, device='cuda', dtype=torch.float32).view(1, 1, 1, -1)
+    b, n_kv, m, n = 2, 4, 128, 256
+    A = torch.randn(b, n_kv, m, n, device='cuda', dtype=torch.float16)
+    # A = torch.ones(16384, device='cuda', dtype=torch.float16).view(2, 4, 4, -1)
 
     _ = efficient_cumsum(A)
     torch.cuda.synchronize()
