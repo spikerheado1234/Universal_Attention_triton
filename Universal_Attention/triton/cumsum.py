@@ -46,8 +46,7 @@ def cumsum_kernel(
 
     A_ptr += pid_b * stride_ab + pid_n_kv * stride_an_kv
     A_cs_ptr += pid_b * stride_acsb + pid_n_kv * stride_acsn_kv
-    # The ptr offset should be the same as A's
-    sem_ptr += pid_b * stride_semab + pid_n_kv * stride_seman_kv 
+    sem_ptr += pid_b * stride_semab + pid_n_kv * stride_seman_kv + pid_m * stride_semam
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     A_mat = tl.load(
@@ -103,22 +102,35 @@ def efficient_cumsum(A: torch.Tensor) -> torch.Tensor:
     return A_cs
 
 if __name__ == "__main__":
-    b, n_kv, m, n = 2, 4, 128, 256
-    A = torch.randn(b, n_kv, m, n, device='cuda', dtype=torch.float16)
-    # A = torch.ones(16384, device='cuda', dtype=torch.float16).view(2, 4, 4, -1)
+    b, n_kv, m, n = 2, 4, 16384, 16384
+    runs = 1000
+    dtype = torch.float32
+
+    A = torch.randn(b, n_kv, m, n, device='cuda', dtype=dtype)
 
     _ = efficient_cumsum(A)
     torch.cuda.synchronize()
 
-    start_time = time.time()
+    triton_time, torch_time = 0, 0
+    for _ in range(runs):
+        A = torch.randn(b, n_kv, m, n, device='cuda', dtype=dtype)
+
+        start_time = time.time()
+        _ = efficient_cumsum(A)  
+        triton_time += time.time() - start_time
+
+        start_time = time.time()
+        _ = torch.cumsum(A, dim=-1)
+        torch_time += time.time() - start_time
+
+        del A
+    
+    A = torch.randn(b, n_kv, m, n, device='cuda', dtype=dtype)
     A_cs = efficient_cumsum(A)
-    print(f"Triton kernel time: {time.time() - start_time}")
-    print(A_cs)
-
-    start_time = time.time()
     A_cs_ref = torch.cumsum(A, dim=-1)
-    print(f"Pytorch kernel time: {time.time() - start_time}")
 
-    print("Max error:", (A_cs.float() - A_cs_ref.float()).abs().max())
+    print(f"Triton kernel time: {triton_time}")
+    print(f"Pytorch kernel time: {torch_time}")
 
-
+    print("Avg error:", (A_cs - A_cs_ref).abs().mean())
+    print("Max error:", (A_cs - A_cs_ref).abs().max())
