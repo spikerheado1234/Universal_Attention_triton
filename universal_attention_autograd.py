@@ -34,7 +34,10 @@ class UniversalAttention(Function):
 
             out[...,i] = out_
             denom[...,i] = denom_
-        return out, denom
+        
+        output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
+
+        return output
 
     @staticmethod
     def setup_context(ctx, inputs, outputs):

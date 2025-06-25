@@ -3,48 +3,6 @@ import triton
 import triton.language as tl
 
 
-# class UniversalAttention(Function):
-#     @staticmethod
-#     def forward(q, k, v, src, dest):
-#         b, n, s, d = q.shape
-#         _, n_kv, _, _ = k.shape
-#           q.shape == (b, n, s, d)
-#         assert k.shape == (b, n_kv, s, d)
-#         assert v.shape == (b, n_kv, s, d)
-#         assert src.shape == (b, n_kv, s)
-#         assert dest.shape == (b, n_kv, s)
-#         if q.stride(-1) != 1:
-#             q = q.contiguous()
-#         if k.stride(-1) != 1:
-#             k = k.contiguous()
-#         if v.stride(-1) != 1:
-#             v = v.contiguous()
-#         if src.stride(-1) != 1:
-#             src = src.contiguous()
-#         if dest.stride(-1) != 1:
-#             dest = dest.contiguous()
-#         output = _universal_attention_fwd(q, k, v, src, dest)
-#         return output
-
-#     @staticmethod
-#     def setup_context(ctx, inputs, outputs):
-#         q, k, v, src, dest = inputs
-#         # out, denom = outputs
-#         ctx.save_for_backward(q, k, v, src, dest)
-
-#     @staticmethod
-#     def backward(ctx, doutput):
-#         # Note: when using mixed precision, dout is downcast but ddenom is always fp32
-#         q, k, v, src, dest = ctx.saved_tensors
-#         b, n, s, d = q.shape
-#         _, n_kv, _, _ = k.shape
-#         assert doutput.shape == (b, n, s, d)
-#         if doutput.stride(-1) != 1:
-#             doutput = doutput.contiguous()
-#         dq, dk, dv, dsrc, ddest = _universal_attention_bwd(q, k, v, src, dest, doutput)
-#         return dq, dk, dv, dsrc, ddest
-
-
 '''
 ######################################
 #     Forward Kernel & Interface     #
@@ -69,7 +27,7 @@ import triton.language as tl
 @triton.jit
 def _universal_attention_fwd_kernel(
     # Pointers to matrices
-    q_ptr, k_ptr, v_ptr, src_ptr, dest_ptr, output_ptr, semaphore_ptr,
+    q_ptr, k_ptr, v_ptr, src_ptr, dest_ptr, output_ptr, sema_ptr, cache_ptr, 
     # Matrix dimensions
     b, n_kv, rep, s, d, 
     # Strides
@@ -79,8 +37,11 @@ def _universal_attention_fwd_kernel(
     stride_src_b, stride_src_n_kv, stride_src_s, 
     stride_dest_b, stride_dest_n_kv, stride_dest_s, 
     stride_output_b, stride_output_n, stride_output_s, stride_output_d, 
+    stride_sema_b, stride_sema_n_kv, stride_sema_s,
+    stride_cache_b, stride_cache_n_kv, stride_cache_s,
     # Meta-parameters
     BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, 
+    DTYPE: tl.constexpr,
 ):
     pid_b_n_kv = tl.program_id(0)
     pid_b = pid_b_n_kv // n_kv
@@ -90,55 +51,110 @@ def _universal_attention_fwd_kernel(
 
     offs_m = pid_m * BLOCK_C + tl.arange(0, BLOCK_C)
     offs_n = pid_n * BLOCK_C + tl.arange(0, BLOCK_C)
+    
+    affinity = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
 
     # k @ k^T
     k_ptr += pid_b * stride_k_b + pid_n_kv * stride_k_n_kv
-    acc = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
 
     for d_offset in range(0, d, BLOCK_D):
         offs_d = d_offset + tl.arange(0, BLOCK_D)
-        k_mat = tl.load(
-            k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d,
-            mask=offs_m[:, None] < s & offs_d[None, :] < d,
-            other=0.0
-        )
-        kt_mat = tl.load(
-            k_ptr + offs_n[:, None] * stride_k_s + offs_d[None, :] * stride_k_d,
-            mask=offs_n[:, None] < s & offs_d[None, :] < d,
-            other=0.0
-        )
-        acc += tl.dot(k_mat, kt_mat)
+        k_mat = tl.load(k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+        k_mat = tl.cast(k_mat, tl.float32)
+
+        kt_mat = tl.load(k_ptr + offs_n[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_n[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+        kt_mat = tl.cast(kt_mat, tl.float32)
+
+        # Use ieee to use fp32, otherwise the default would be tf32
+        affinity += tl.dot(k_mat, tl.trans(kt_mat), input_precision="ieee")
     
     # .relu()
-    acc = tl.maximum(acc, 0.0)
+    affinity = tl.maximum(affinity, 0.0)
 
     # .pow(2/3)
-    acc = tl.exp2(tl.log2(acc) * 2.0 / 3.0)
+    affinity = tl.exp2(tl.log2(affinity) * 2.0 / 3.0)
 
     # * static_src_.pow(1/3).unsqueeze(-1) * static_dest.pow(1/3).unsqueeze(-2)
     src_ptr += pid_b * stride_src_b + pid_n_kv * stride_src_n_kv
     dest_ptr += pid_b * stride_dest_b + pid_n_kv * stride_dest_n_kv
 
-    src_mat  = tl.load(
-        src_ptr  + offs_m * stride_src_s,
-        mask=offs_m < s, 
-        other=0.0
-    )
+    src_mat  = tl.load(src_ptr + offs_m * stride_src_s, mask=offs_m < s, other=0.0)
+    src_mat = tl.cast(src_mat, tl.float32)
     src_mat = tl.exp2(tl.log2(src_mat) / 3.0)
-    
-    dest_mat = tl.load(dest_ptr + offs_n * stride_dest_s,
-        mask=offs_n < s, 
-        other=0.0
-    )
+
+    dest_mat = tl.load(dest_ptr + offs_n * stride_dest_s, mask=offs_n < s, other=0.0)
+    dest_mat = tl.cast(dest_mat, tl.float32)
     dest_mat = tl.exp2(tl.log2(dest_mat) / 3.0)
 
-    acc = acc * src_mat[:, None] * dest_mat[None, :]
+    affinity = affinity * src_mat[:, None] * dest_mat[None, :]
 
-    tl.store(
-        C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
-    )
+    # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
+    affinity = tl.clamp(affinity, 0.0, 1.0 - 1e-6)
+    affinity = tl.log(1.0 - affinity) 
+
+    # .triu(1)
+    triu_mask = (offs_n[None, :] >= (offs_m[:, None] - 1))
+    affinity = tl.where(triu_mask, affinity, 0.0)
+
+    # .cumsum(3)
+    sem_ptr += pid_b * stride_sema_b + pid_n_kv * stride_sema_n_kv + pid_m * stride_sema_s
+    cache_ptr += pid_b * stride_cache_b + pid_n_kv * stride_cache_n_kv 
+    
+    affinity = tl.cumsum(affinity, axis=-1) # local cumsum
+    curr_sum = tl.sum(A_mat, axis=-1, keep_dims=False) # put the sum into the cache
+
+    # Make sure the sum is passed sequentially
+    while tl.atomic_add(sem_ptr, 0) < pid_n:
+        pass
+
+    prev_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    if pid_n > 0:
+        prev_sum = tl.load(cache_ptr + offs_m * stride_cache_s, mask=offs_m < m, other=0.0) 
+    tl.store(cache_ptr + offs_m * stride_cache_s, curr_sum + prev_sum, mask=offs_m < m)
+
+    tl.atomic_add(sem_ptr, 1)
+
+    affinity = affinity + prev_sum[:, None]
+
+    # .masked_fill(mask.tril(-1), -1e12)
+    tril_mask = (offs_n[None, :] <= (offs_m[:, None] - 1))
+    affinity = tl.where(tril_mask, -1e12, affinity)
+
+    # Affinity compute completed here
+
+    # k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))
+    q_ptr += pid_b * stride_q_b + pid_n_kv * rep * stride_q_n
+    output_ptr += pid_b * stride_output_b + pid_n_kv * rep * stride_output_n
+
+    # Haochen: 3D mat mul is supported by triton, but not by llvm in general, so it is not used here. 
+    for r in range(0, rep):
+        # k @ q^T
+        qk = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
+
+        for d_offset in range(0, d, BLOCK_D):
+            offs_d = d_offset + tl.arange(0, BLOCK_D)
+
+            k_mat = tl.load(k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+            k_mat = tl.cast(k_mat, tl.float32)
+
+            q_mat = tl.load(q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), other=0.0)
+            q_mat = tl.cast(q_mat, tl.float32)
+
+            # Use ieee to use fp32, otherwise the default would be tf32
+            qk += tl.dot(k_mat, tl.trans(B_mat), input_precision="ieee")
+        
+        qk += affinity
+
+        # I'm here! The only thing left is Softmax(...)@V
+
+        acc = tl.cast(acc, DTYPE) # Downcast to old datatype
+
+        tl.store(
+            output_ptr + r * stride_output_n + offs_m[:, None] * stride_output_s + offs_n[None, :] * stride_output_d,
+            acc,
+            mask=(offs_m[:, None] < i) & (offs_n[None, :] < j),
+        )
+    
 
 def _universal_attention_fwd(q, k, v, src, dest):
     b, n, s, d = q.shape
@@ -146,16 +162,16 @@ def _universal_attention_fwd(q, k, v, src, dest):
     assert n % n_kv == 0, "n needs to be divisible by n_kv"
     rep = n // n_kv
     device = q.device
-
-    # chunk sequence length: META['BLOCK_C']
+    dtype_flag = tl.float16 if A.dtype == torch.float16 else tl.float32
     
     output = torch.empty(b, n, s, d, dtype=q.dtype, device=device)
     semaphore = torch.zeros(b, n_kv, s, dtype=torch.int32, device=device)
+    cs_cache = torch.empty(b, n_kv, s, dtype=torch.float32, device=device)
 
     grid = lambda META: (b * n_kv, triton.cdiv(s, META['BLOCK_C']), triton.cdiv(s, META['BLOCK_C']))
 
     _universal_attention_fwd_kernel[grid](
-        q, k, v, src, dest, output, semaphore,
+        q, k, v, src, dest, output, semaphore, cs_cache,
         b, n_kv, rep, s, d, 
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),                         # (b, n, s, d)
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),                         # (b, n_kv, s, d)
@@ -163,6 +179,9 @@ def _universal_attention_fwd(q, k, v, src, dest):
         src.stride(0), src.stride(1), src.stride(2),                                # (b, n_kv, s)
         dest.stride(0), dest.stride(1), dest.stride(2),                             # (b, n_kv, s)
         output.stride(0), output.stride(1), output.stride(2), output.stride(3),     # (b, n, s, d)
+        semaphore.stride(0), semaphore.stride(1), semaphore.stride(2),              # (b, n_kv, s)
+        cs_cache.stride(0), cs_cache.stride(1), cs_cache.stride(2),                 # (b, n_kv, s)
+        DTYPE=dtype_flag,
     )
 
     return output
