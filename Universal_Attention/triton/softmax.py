@@ -73,9 +73,10 @@ def softmax_kernel(
     tl.store(sum_cache_ptr + offs_m * stride_sum_m + pid_n * stride_sum_n, A_sumexp, mask=(offs_m < m))
     
     tl.atomic_add(semaphore_ptr, 1)
-    while tl.atomic_add(semaphore_ptr, 0) < N_BLOCK:
+    # Don't use atomic read here, or it will prevent other atomic updates
+    while tl.load(semaphore_ptr, mask=True, other=0) < N_BLOCK:
         pass
-    
+
     localmax_mat = tl.load(
         max_cache_ptr + offs_m[:, None] * stride_max_m + block_idx[None, :] * stride_max_n,
         mask=(offs_m[:, None] < m) & (block_idx[None, :] < N_BLOCK),
