@@ -35,8 +35,6 @@ class UniversalAttention(Function):
             out[...,i] = out_
             denom[...,i] = denom_
         
-        output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
-
         return output
 
     @staticmethod

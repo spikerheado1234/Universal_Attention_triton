@@ -27,7 +27,8 @@ import triton.language as tl
 @triton.jit
 def _universal_attention_fwd_kernel(
     # Pointers to matrices
-    q_ptr, k_ptr, v_ptr, src_ptr, dest_ptr, output_ptr, sema_ptr, cache_ptr, 
+    q_ptr, k_ptr, v_ptr, src_ptr, dest_ptr, output_ptr, 
+    sema_ptr, cache_ptr, 
     # Matrix dimensions
     b, n_kv, rep, s, d, 
     # Strides
@@ -100,8 +101,8 @@ def _universal_attention_fwd_kernel(
     sem_ptr += pid_b * stride_sema_b + pid_n_kv * stride_sema_n_kv + pid_m * stride_sema_s
     cache_ptr += pid_b * stride_cache_b + pid_n_kv * stride_cache_n_kv 
     
-    affinity = tl.cumsum(affinity, axis=-1) # local cumsum
-    curr_sum = tl.sum(A_mat, axis=-1, keep_dims=False) # put the sum into the cache
+    affinity = tl.cumsum(affinity, axis=1) # local cumsum
+    curr_sum = tl.sum(A_mat, axis=1, keep_dims=False) # put the sum into the cache
 
     # Make sure the sum is passed sequentially
     while tl.atomic_add(sem_ptr, 0) < pid_n:
@@ -145,7 +146,14 @@ def _universal_attention_fwd_kernel(
         
         qk += affinity
 
-        # I'm here! The only thing left is Softmax(...)@V
+        # Softmax(QK + mask)
+        # qk -= tl.max(qk, axis=0)
+        qk = tl.exp(qk)
+        denom = tl.sum(qk, axis=0)
+
+        # Algo: write to a summation cache separatly, 
+
+        # I'm here! The only thing left is Softmax(...) @ V
 
         acc = tl.cast(acc, DTYPE) # Downcast to old datatype
 

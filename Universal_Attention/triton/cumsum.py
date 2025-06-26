@@ -45,7 +45,6 @@ def cumsum_kernel(
     sem_ptr += pid_b * stride_semab + pid_n_kv * stride_seman_kv + pid_m * stride_semam
     cs_cache_ptr += pid_b * stride_ccb + pid_n_kv * stride_ccn_kv #+ offs_m
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     A_mat = tl.load(
         A_ptr + offs_m[:, None] * stride_am + offs_n[None, :] * stride_an,
         mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
