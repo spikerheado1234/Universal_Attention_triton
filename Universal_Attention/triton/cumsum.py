@@ -56,7 +56,7 @@ def cumsum_kernel(
     acc = tl.cumsum(A_mat, axis=-1)
     curr_sum = tl.sum(A_mat, axis=-1, keep_dims=False) # put the sum into the cache
 
-    while tl.atomic_add(sem_ptr, 0) < pid_n:
+    while tl.load(sem_ptr, mask=True, other=0) < pid_n:
         pass
 
     prev_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
