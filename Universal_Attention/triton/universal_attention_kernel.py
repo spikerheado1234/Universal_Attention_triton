@@ -2,6 +2,11 @@ import torch
 import triton
 import triton.language as tl
 
+configs = [
+    triton.Config({}, num_stages=stages, num_warps=warps) \
+    for stages in [2, 3, 4, 5]\
+    for warps in [2, 4, 8, 16]\
+]
 
 '''
 ######################################
@@ -9,19 +14,7 @@ import triton.language as tl
 ######################################
 '''
 @triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 128, 'BLOCK_D': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_C': 32, 'BLOCK_D': 32}, num_stages=5, num_warps=2),
-        triton.Config({'BLOCK_C': 64, 'BLOCK_D': 32}, num_stages=4, num_warps=2),
-    ],
+    configs=configs,
     key=['s', 'd'],
 )
 @triton.jit
@@ -60,10 +53,18 @@ def _universal_attention_fwd_kernel(
 
     for d_offset in range(0, d, BLOCK_D):
         offs_d = d_offset + tl.arange(0, BLOCK_D)
-        k_mat = tl.load(k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+        k_mat = tl.load(
+            k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, 
+            mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), 
+            other=0.0
+        )
         k_mat = tl.cast(k_mat, tl.float32)
 
-        kt_mat = tl.load(k_ptr + offs_n[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_n[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+        kt_mat = tl.load(
+            k_ptr + offs_n[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, 
+            mask=(offs_n[:, None] < s) & (offs_d[None, :] < d), 
+            other=0.0
+        )
         kt_mat = tl.cast(kt_mat, tl.float32)
 
         # Use ieee to use fp32, otherwise the default would be tf32
@@ -105,12 +106,16 @@ def _universal_attention_fwd_kernel(
     curr_sum = tl.sum(A_mat, axis=1, keep_dims=False) # put the sum into the cache
 
     # Make sure the sum is passed sequentially
-    while tl.atomic_add(sem_ptr, 0) < pid_n:
+    while tl.load(sem_ptr, mask=True, other=0) < pid_n:
         pass
 
     prev_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     if pid_n > 0:
-        prev_sum = tl.load(cache_ptr + offs_m * stride_cache_s, mask=offs_m < m, other=0.0) 
+        prev_sum = tl.load(
+            cache_ptr + offs_m * stride_cache_s, 
+            mask=offs_m < m, 
+            other=0.0
+        ) 
     tl.store(cache_ptr + offs_m * stride_cache_s, curr_sum + prev_sum, mask=offs_m < m)
 
     tl.atomic_add(sem_ptr, 1)
@@ -125,6 +130,7 @@ def _universal_attention_fwd_kernel(
 
     # k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))
     q_ptr += pid_b * stride_q_b + pid_n_kv * rep * stride_q_n
+    v_ptr += pid_b * stride_v_b + pid_n_kv * rep * stride_v_n
     output_ptr += pid_b * stride_output_b + pid_n_kv * rep * stride_output_n
 
     # Haochen: 3D mat mul is supported by triton, but not by llvm in general, so it is not used here. 
@@ -135,23 +141,84 @@ def _universal_attention_fwd_kernel(
         for d_offset in range(0, d, BLOCK_D):
             offs_d = d_offset + tl.arange(0, BLOCK_D)
 
-            k_mat = tl.load(k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), other=0.0)
+            k_mat = tl.load(
+                k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, 
+                mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), 
+                other=0.0,
+            )
             k_mat = tl.cast(k_mat, tl.float32)
 
-            q_mat = tl.load(q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), other=0.0)
+            q_mat = tl.load(
+                q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, 
+                mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), 
+                other=0.0,
+            )
             q_mat = tl.cast(q_mat, tl.float32)
 
             # Use ieee to use fp32, otherwise the default would be tf32
-            qk += tl.dot(k_mat, tl.trans(B_mat), input_precision="ieee")
+            qk += tl.dot(k_mat, tl.trans(q_mat), input_precision="ieee")
         
         qk += affinity
 
         # Softmax(QK + mask)
-        # qk -= tl.max(qk, axis=0)
-        qk = tl.exp(qk)
-        denom = tl.sum(qk, axis=0)
+        localmax = tl.max(qk, axis=1)
+        tl.store(
+            max_cache_ptr + offs_m * stride_max_m + pid_n * stride_max_n, 
+            localmax, 
+            mask=(offs_m < m)
+        )
 
-        # Algo: write to a summation cache separatly, 
+        qk = tl.exp(qk - localmax[:, None])
+        qk_sumexp = tl.sum(qk, axis=1)
+        tl.store(
+            sum_cache_ptr + offs_m * stride_sum_m + pid_n * stride_sum_n, 
+            qk_sumexp, 
+            mask=(offs_m < m)
+        )
+
+        tl.atomic_add(semaphore_ptr, 1)
+        # Don't use atomic read here, or it will prevent other atomic operations
+        while tl.load(semaphore_ptr, mask=True, other=0) < N_BLOCK:
+            pass
+
+        localmax_mat = tl.load(
+            max_cache_ptr + offs_m[:, None] * stride_max_m + block_idx[None, :] * stride_max_n,
+            mask=(offs_m[:, None] < m) & (block_idx[None, :] < N_BLOCK),
+            other=-1e9,
+        )
+        globalmax = tl.max(localmax_mat, axis=1)
+        factor = tl.exp(localmax_mat - globalmax[:, None])
+
+        sumexp_mat = tl.load(
+            sum_cache_ptr + offs_m[:, None] * stride_sum_m + block_idx[None, :] * stride_sum_n,
+            mask=(offs_m[:, None] < m) & (block_idx[None, :] < N_BLOCK),
+            other=0.0,
+        )
+        globalsum = tl.sum(sumexp_mat * factor, axis=1)
+
+        qk = qk * tl.exp(localmax - globalmax)[:, None]
+        qk_softmax = tl.div_rn(qk, globalsum[:, None])
+
+        # qk_softmax @ V
+        for d_offset in range(0, d, BLOCK_D):
+            offs_d = d_offset + tl.arange(0, BLOCK_D)
+
+            k_mat = tl.load(
+                k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, 
+                mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), 
+                other=0.0,
+            )
+            k_mat = tl.cast(k_mat, tl.float32)
+
+            q_mat = tl.load(
+                q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, 
+                mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), 
+                other=0.0,
+            )
+            q_mat = tl.cast(q_mat, tl.float32)
+
+            # Use ieee to use fp32, otherwise the default would be tf32
+            qk += tl.dot(k_mat, tl.trans(q_mat), input_precision="ieee")
 
         # I'm here! The only thing left is Softmax(...) @ V
 

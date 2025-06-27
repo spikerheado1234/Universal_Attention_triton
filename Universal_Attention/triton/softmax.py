@@ -3,30 +3,16 @@ import triton.language as tl
 import torch
 import time
 
-# configs = [
-#     triton.Config({'BLOCK_M': BLOCK_M, 'BLOCK_N': BLOCK_N}, num_stages=stages, num_warps=warps) \
-#     for BLOCK_M in [32, 64, 128]\
-#     for BLOCK_N in [32, 64, 128]\
-#     for stages in [2, 3, 4, 5]\
-#     for warps in [2, 4, 8, 16]\
-# ]
+configs = [
+    triton.Config({}, num_stages=stages, num_warps=warps) \
+    for stages in [2, 3, 4]\
+    for warps in [2, 4, 8]\
+]
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256}, num_stages=3, num_warps=8),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=5, num_warps=2),
-#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=5, num_warps=2),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=2),
-#     ],
-#     key=['m', 'n'],
-# )
+@triton.autotune(
+    configs=configs,
+    key=['m', 'n'],
+)
 @triton.jit
 def softmax_kernel(
     A_ptr, B_ptr, semaphore_ptr, max_cache_ptr, sum_cache_ptr, 
@@ -52,8 +38,8 @@ def softmax_kernel(
     B_ptr += pid_b * stride_b_b + pid_n_kv * stride_b_n_kv
 
     semaphore_ptr += pid_b * stride_sem_b + pid_n_kv * stride_sem_n_kv + pid_m * stride_sem_m
-    max_cache_ptr += pid_b * stride_max_b + pid_n_kv * stride_max_n_kv # + pid_m * stride_max_m
-    sum_cache_ptr += pid_b * stride_sum_b + pid_n_kv * stride_sum_n_kv # + pid_m * stride_sum_m
+    max_cache_ptr += pid_b * stride_max_b + pid_n_kv * stride_max_n_kv
+    sum_cache_ptr += pid_b * stride_sum_b + pid_n_kv * stride_sum_n_kv
     
     A_mat = tl.load(
         A_ptr + offs_m[:, None] * stride_a_m + offs_n[None, :] * stride_a_n,
@@ -73,7 +59,7 @@ def softmax_kernel(
     tl.store(sum_cache_ptr + offs_m * stride_sum_m + pid_n * stride_sum_n, A_sumexp, mask=(offs_m < m))
     
     tl.atomic_add(semaphore_ptr, 1)
-    # Don't use atomic read here, or it will prevent other atomic updates
+    # Don't use atomic read here, or it will prevent other atomic operations
     while tl.load(semaphore_ptr, mask=True, other=0) < N_BLOCK:
         pass
 
@@ -101,7 +87,7 @@ def softmax_kernel(
         mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
     )
 
-def efficient_softmax(A: torch.Tensor) -> torch.Tensor:
+def softmax_triton(A: torch.Tensor) -> torch.Tensor:
     b, n_kv, m, n = A.shape
 
     BLOCK_M = 64
@@ -138,11 +124,11 @@ if __name__ == "__main__":
     A = torch.randn(b, n_kv, m, n, device='cuda', dtype=torch.float32) * 10
     
     # Warm up first
-    _ = efficient_softmax(A)
+    _ = softmax_triton(A)
     torch.cuda.synchronize()
 
     start_time = time.time()
-    B = efficient_softmax(A)
+    B = softmax_triton(A)
     print(f"Triton kernel time: {time.time() - start_time}")
 
     start_time = time.time()
