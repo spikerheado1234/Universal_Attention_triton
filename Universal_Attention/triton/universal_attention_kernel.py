@@ -136,7 +136,7 @@ def _universal_attention_fwd_kernel(
     # Haochen: 3D mat mul is supported by triton, but not by llvm in general, so it is not used here. 
     for r in range(0, rep):
         # k @ q^T
-        qk = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
+        kq = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
 
         for d_offset in range(0, d, BLOCK_D):
             offs_d = d_offset + tl.arange(0, BLOCK_D)
@@ -156,9 +156,10 @@ def _universal_attention_fwd_kernel(
             q_mat = tl.cast(q_mat, tl.float32)
 
             # Use ieee to use fp32, otherwise the default would be tf32
-            qk += tl.dot(k_mat, tl.trans(q_mat), input_precision="ieee")
+            kq += tl.dot(k_mat, tl.trans(q_mat), input_precision="ieee")
         
-        qk += affinity
+        kq += affinity
+        qk = tl.trans(kq)
 
         # Softmax(QK + mask)
         localmax = tl.max(qk, axis=1)
@@ -200,6 +201,11 @@ def _universal_attention_fwd_kernel(
         qk_softmax = tl.div_rn(qk, globalsum[:, None])
 
         # qk_softmax @ V
+        for c in range(0, tl.cdiv(s, BLOCK_C)):
+            if c == 
+            c_offset = c * BLOCK_C
+            # qk_softmax @ v: Load chunks (BLOCK_C, BLOCK_C) @ (BLOCK_C, BLOCK_D)
+            
         for d_offset in range(0, d, BLOCK_D):
             offs_d = d_offset + tl.arange(0, BLOCK_D)
 
