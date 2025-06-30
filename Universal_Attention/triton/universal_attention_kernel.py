@@ -21,20 +21,26 @@ configs = [
 def _universal_attention_fwd_kernel(
     # Pointers to matrices
     q_ptr, k_ptr, v_ptr, src_ptr, dest_ptr, output_ptr, 
-    sema_ptr, cache_ptr, 
+    spinlock_ptr, semaphore_ptr, sense_rev_ptr, 
+    cum_cache_ptr, max_cache_ptr, sum_cache_ptr, 
     # Matrix dimensions
     b, n_kv, rep, s, d, 
     # Strides
-    stride_q_b, stride_q_n, stride_q_s, stride_q_d, 
+    stride_q_b, stride_q_n_rep, stride_q_s, stride_q_d, 
     stride_k_b, stride_k_n_kv, stride_k_s, stride_k_d, 
     stride_v_b, stride_v_n_kv, stride_v_s, stride_v_d,
     stride_src_b, stride_src_n_kv, stride_src_s, 
     stride_dest_b, stride_dest_n_kv, stride_dest_s, 
-    stride_output_b, stride_output_n, stride_output_s, stride_output_d, 
-    stride_sema_b, stride_sema_n_kv, stride_sema_s,
-    stride_cache_b, stride_cache_n_kv, stride_cache_s,
+    stride_output_b, stride_output_n_rep, stride_output_s, stride_output_d, 
+    stride_spl_b, stride_spl_n_kv, stride_spl_s,
+    stride_sem_b, stride_sem_n_kv, stride_sem_s,
+    stride_rev_b, stride_rev_n_kv, stride_rev_s,
+    stride_cum_b, stride_cum_n_kv, stride_cum_s,
+    stride_max_b, stride_max_n_kv, stride_max_s, stride_max_c, 
+    stride_sum_b, stride_sum_n_kv, stride_sum_s, stride_sum_c, 
     # Meta-parameters
     BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr, 
+    C_BLOCK: tl.constexpr, D_BLOCK: tl.constexpr,
     DTYPE: tl.constexpr,
 ):
     pid_b_n_kv = tl.program_id(0)
@@ -67,7 +73,7 @@ def _universal_attention_fwd_kernel(
         )
         kt_mat = tl.cast(kt_mat, tl.float32)
 
-        # Use ieee to use fp32, otherwise the default would be tf32
+        # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
         affinity += tl.dot(k_mat, tl.trans(kt_mat), input_precision="ieee")
     
     # .relu()
@@ -80,11 +86,19 @@ def _universal_attention_fwd_kernel(
     src_ptr += pid_b * stride_src_b + pid_n_kv * stride_src_n_kv
     dest_ptr += pid_b * stride_dest_b + pid_n_kv * stride_dest_n_kv
 
-    src_mat  = tl.load(src_ptr + offs_m * stride_src_s, mask=offs_m < s, other=0.0)
+    src_mat  = tl.load(
+        src_ptr + offs_m * stride_src_s, 
+        mask=offs_m < s, 
+        other=0.0
+    )
     src_mat = tl.cast(src_mat, tl.float32)
     src_mat = tl.exp2(tl.log2(src_mat) / 3.0)
 
-    dest_mat = tl.load(dest_ptr + offs_n * stride_dest_s, mask=offs_n < s, other=0.0)
+    dest_mat = tl.load(
+        dest_ptr + offs_n * stride_dest_s, 
+        mask=offs_n < s, 
+        other=0.0
+    )
     dest_mat = tl.cast(dest_mat, tl.float32)
     dest_mat = tl.exp2(tl.log2(dest_mat) / 3.0)
 
@@ -99,26 +113,30 @@ def _universal_attention_fwd_kernel(
     affinity = tl.where(triu_mask, affinity, 0.0)
 
     # .cumsum(3)
-    sem_ptr += pid_b * stride_sema_b + pid_n_kv * stride_sema_n_kv + pid_m * stride_sema_s
-    cache_ptr += pid_b * stride_cache_b + pid_n_kv * stride_cache_n_kv 
+    spinlock_ptr += pid_b * stride_spl_b + pid_n_kv * stride_spl_n_kv + pid_m * stride_spl_s
+    cum_cache_ptr += pid_b * stride_cum_b + pid_n_kv * stride_cum_n_kv 
     
     affinity = tl.cumsum(affinity, axis=1) # local cumsum
     curr_sum = tl.sum(A_mat, axis=1, keep_dims=False) # put the sum into the cache
 
-    # Make sure the sum is passed sequentially
-    while tl.load(sem_ptr, mask=True, other=0) < pid_n:
+    # Make sure the sum is computed sequentially
+    while tl.load(spinlock_ptr, mask=True, other=0) < pid_n:
         pass
 
-    prev_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    prev_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
     if pid_n > 0:
         prev_sum = tl.load(
-            cache_ptr + offs_m * stride_cache_s, 
-            mask=offs_m < m, 
+            cum_cache_ptr + offs_m * stride_cum_s, 
+            mask=offs_m < s, 
             other=0.0
         ) 
-    tl.store(cache_ptr + offs_m * stride_cache_s, curr_sum + prev_sum, mask=offs_m < m)
+    tl.store(
+        cache_ptr + offs_m * stride_cum_s, 
+        curr_sum + prev_sum, 
+        mask=offs_m < s
+    )
 
-    tl.atomic_add(sem_ptr, 1)
+    tl.atomic_add(spinlock_ptr, 1)
 
     affinity = affinity + prev_sum[:, None]
 
@@ -126,16 +144,18 @@ def _universal_attention_fwd_kernel(
     tril_mask = (offs_n[None, :] <= (offs_m[:, None] - 1))
     affinity = tl.where(tril_mask, -1e12, affinity)
 
-    # Affinity compute completed here
+    # Affinity matrix completed here
 
     # k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))
-    q_ptr += pid_b * stride_q_b + pid_n_kv * rep * stride_q_n
-    v_ptr += pid_b * stride_v_b + pid_n_kv * rep * stride_v_n
-    output_ptr += pid_b * stride_output_b + pid_n_kv * rep * stride_output_n
+    q_ptr += pid_b * stride_q_b + pid_n_kv * rep * stride_q_n_rep
+    v_ptr += pid_b * stride_v_b + pid_n_kv * rep * stride_v_n_kv
+    output_ptr += pid_b * stride_output_b + pid_n_kv * rep * stride_output_n_rep
 
-    # Haochen: 3D mat mul is supported by triton, but not by llvm in general, so it is not used here. 
+    # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
+    # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
     for r in range(0, rep):
         # k @ q^T
+        output_rep_ptr = output_ptr + r * stride_output_n_rep
         kq = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
 
         for d_offset in range(0, d, BLOCK_D):
@@ -149,8 +169,8 @@ def _universal_attention_fwd_kernel(
             k_mat = tl.cast(k_mat, tl.float32)
 
             q_mat = tl.load(
-                q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, 
-                mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), 
+                q_ptr + r * stride_q_n_rep + offs_n[:, None] * stride_q_s + offs_d[None, :] * stride_q_d, 
+                mask=(offs_n[:, None] < s) & (offs_d[None, :] < d), 
                 other=0.0,
             )
             q_mat = tl.cast(q_mat, tl.float32)
@@ -164,35 +184,35 @@ def _universal_attention_fwd_kernel(
         # Softmax(QK + mask)
         localmax = tl.max(qk, axis=1)
         tl.store(
-            max_cache_ptr + offs_m * stride_max_m + pid_n * stride_max_n, 
+            max_cache_ptr + offs_m * stride_max_s + pid_n * stride_max_c, 
             localmax, 
-            mask=(offs_m < m)
+            mask=(offs_m < s)
         )
 
         qk = tl.exp(qk - localmax[:, None])
         qk_sumexp = tl.sum(qk, axis=1)
         tl.store(
-            sum_cache_ptr + offs_m * stride_sum_m + pid_n * stride_sum_n, 
+            sum_cache_ptr + offs_m * stride_sum_s + pid_n * stride_sum_c, 
             qk_sumexp, 
-            mask=(offs_m < m)
+            mask=(offs_m < s)
         )
 
         tl.atomic_add(semaphore_ptr, 1)
         # Don't use atomic read here, or it will prevent other atomic operations
-        while tl.load(semaphore_ptr, mask=True, other=0) < N_BLOCK:
+        while tl.load(semaphore_ptr, mask=True, other=0) < C_BLOCK:
             pass
 
         localmax_mat = tl.load(
-            max_cache_ptr + offs_m[:, None] * stride_max_m + block_idx[None, :] * stride_max_n,
-            mask=(offs_m[:, None] < m) & (block_idx[None, :] < N_BLOCK),
+            max_cache_ptr + offs_m[:, None] * stride_max_s + blocd_idx[None, :] * stride_max_c,
+            mask=(offs_m[:, None] < s) & (blocd_idx[None, :] < C_BLOCK),
             other=-1e9,
         )
         globalmax = tl.max(localmax_mat, axis=1)
         factor = tl.exp(localmax_mat - globalmax[:, None])
 
         sumexp_mat = tl.load(
-            sum_cache_ptr + offs_m[:, None] * stride_sum_m + block_idx[None, :] * stride_sum_n,
-            mask=(offs_m[:, None] < m) & (block_idx[None, :] < N_BLOCK),
+            sum_cache_ptr + offs_m[:, None] * stride_sum_s + blocd_idx[None, :] * stride_sum_c,
+            mask=(offs_m[:, None] < s) & (blocd_idx[None, :] < C_BLOCK),
             other=0.0,
         )
         globalsum = tl.sum(sumexp_mat * factor, axis=1)
@@ -201,41 +221,44 @@ def _universal_attention_fwd_kernel(
         qk_softmax = tl.div_rn(qk, globalsum[:, None])
 
         # qk_softmax @ V
-        for c in range(0, tl.cdiv(s, BLOCK_C)):
-            if c == 
-            c_offset = c * BLOCK_C
-            # qk_softmax @ v: Load chunks (BLOCK_C, BLOCK_C) @ (BLOCK_C, BLOCK_D)
-            
-        for d_offset in range(0, d, BLOCK_D):
-            offs_d = d_offset + tl.arange(0, BLOCK_D)
+        if pid_n == 0:
+            tl.atomic_xchg(semaphore_ptr, 0)
+        while tl.load(semaphore_ptr, mask=True, other=0) > 0:
+            pass
 
-            k_mat = tl.load(
-                k_ptr + offs_m[:, None] * stride_k_s + offs_d[None, :] * stride_k_d, 
-                mask=(offs_m[:, None] < s) & (offs_d[None, :] < d), 
-                other=0.0,
-            )
-            k_mat = tl.cast(k_mat, tl.float32)
+        for idx in range(0, C_BLOCK + D_BLOCK - 1):
+            # Clean the semaphore
+            local_sense = tl.load(sense_rev_ptr, mask=True, other=0)
+            num_proc = tl.atomic_add(semaphore_ptr, 1)
+            if num_proc == C_BLOCK - 1:
+                tl.atomic_xchg(semaphore_ptr, 0)
+                tl.atomic_xchg(sense_rev_ptr, 1 - local_sense)
+            else:
+                while tl.load(sense_rev_ptr, mask=True, other=0) == local_sense:
+                    pass
 
-            q_mat = tl.load(
-                q_ptr + r * stride_q_n + offs_n[:, None] * stride_q_s + offs_k[None, :] * stride_q_d, 
-                mask=(offs_n[:, None] < s) & (offs_k[None, :] < d), 
-                other=0.0,
-            )
-            q_mat = tl.cast(q_mat, tl.float32)
-
-            # Use ieee to use fp32, otherwise the default would be tf32
-            qk += tl.dot(k_mat, tl.trans(q_mat), input_precision="ieee")
-
-        # I'm here! The only thing left is Softmax(...) @ V
-
-        acc = tl.cast(acc, DTYPE) # Downcast to old datatype
-
-        tl.store(
-            output_ptr + r * stride_output_n + offs_m[:, None] * stride_output_s + offs_n[None, :] * stride_output_d,
-            acc,
-            mask=(offs_m[:, None] < i) & (offs_n[None, :] < j),
-        )
-    
+            d_idx = idx - pid_n 
+            if d_idx >= 0 and d_idx < D_BLOCK:
+                offs_d = d_idx * BLOCK_D + tl.arange(0, BLOCK_D)
+                stride_v_s, stride_v_d,
+                v_mat = tl.load(
+                    v_ptr + offs_n[:, None] * stride_v_s + offs_d[None, :] * stride_v_d,
+                    mask=(offs_n[:, None] < s) & (offs_d[None, :] < d),
+                    other=0.0,
+                )
+                prev_sum = tl.load(
+                    output_rep_ptr + offs_m[:, None] * stride_output_s + offs_d[None, :] * stride_output_d,
+                    mask=(offs_m[:, None] < s) & (offs_d[None, :] < d),
+                    other=0.0,
+                )
+                curr_sum = prev_sum + tl.dot(qk_softmax, B_mat, input_precision="ieee")
+                # curr_sum = tl.cast(curr_sum, DTYPE) # Downcast to old datatype
+                tl.store(
+                    output_rep_ptr + offs_m[:, None] * stride_output_s + offs_d[None, :] * stride_output_d,
+                    curr_sum,
+                    mask=(offs_m[:, None] < s) & (offs_d[None, :] < d),
+                )
+        
 
 def _universal_attention_fwd(q, k, v, src, dest):
     b, n, s, d = q.shape
