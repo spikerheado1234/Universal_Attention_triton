@@ -124,7 +124,7 @@ def softmax_triton(A: torch.Tensor) -> torch.Tensor:
     key=['m', 'n', 'k'],
 )
 @triton.jit
-def softmax_matmul_kernel_v1(
+def softmax_matmul_kernel(
     A_ptr, B_ptr, C_ptr, 
     semaphore_ptr, sense_rev_ptr, max_cache_ptr, sum_cache_ptr, 
     b, n_kv, m, n, k, 
@@ -258,7 +258,7 @@ def softmax_matmul_triton(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # grid = lambda META: (b * n_kv, triton.cdiv(m, META['BLOCK_M']), triton.cdiv(n, META['BLOCK_N']))
     grid = (b * n_kv, M_BLOCK, N_BLOCK)
 
-    softmax_matmul_kernel_v1[grid](
+    softmax_matmul_kernel[grid](
         A, B, C, 
         semaphore, sense_rev, max_cache, sum_cache, 
         b, n_kv, m, n, k, 

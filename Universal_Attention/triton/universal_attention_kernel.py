@@ -51,7 +51,8 @@ def _universal_attention_fwd_kernel(
 
     offs_m = pid_m * BLOCK_C + tl.arange(0, BLOCK_C)
     offs_n = pid_n * BLOCK_C + tl.arange(0, BLOCK_C)
-    
+    block_idx = tl.arange(0, C_BLOCK)
+
     affinity = tl.zeros((BLOCK_C, BLOCK_C), dtype=tl.float32)
 
     # k @ k^T
@@ -116,8 +117,8 @@ def _universal_attention_fwd_kernel(
     spinlock_ptr += pid_b * stride_spl_b + pid_n_kv * stride_spl_n_kv + pid_m * stride_spl_s
     cum_cache_ptr += pid_b * stride_cum_b + pid_n_kv * stride_cum_n_kv 
     
+    curr_sum = tl.sum(affinity, axis=1, keep_dims=False) # put the sum into the cache
     affinity = tl.cumsum(affinity, axis=1) # local cumsum
-    curr_sum = tl.sum(A_mat, axis=1, keep_dims=False) # put the sum into the cache
 
     # Make sure the sum is computed sequentially
     while tl.load(spinlock_ptr, mask=True, other=0) < pid_n:
@@ -131,7 +132,7 @@ def _universal_attention_fwd_kernel(
             other=0.0
         ) 
     tl.store(
-        cache_ptr + offs_m * stride_cum_s, 
+        cum_cache_ptr + offs_m * stride_cum_s, 
         curr_sum + prev_sum, 
         mask=offs_m < s
     )
@@ -203,16 +204,16 @@ def _universal_attention_fwd_kernel(
             pass
 
         localmax_mat = tl.load(
-            max_cache_ptr + offs_m[:, None] * stride_max_s + blocd_idx[None, :] * stride_max_c,
-            mask=(offs_m[:, None] < s) & (blocd_idx[None, :] < C_BLOCK),
+            max_cache_ptr + offs_m[:, None] * stride_max_s + block_idx[None, :] * stride_max_c,
+            mask=(offs_m[:, None] < s) & (block_idx[None, :] < C_BLOCK),
             other=-1e9,
         )
         globalmax = tl.max(localmax_mat, axis=1)
         factor = tl.exp(localmax_mat - globalmax[:, None])
 
         sumexp_mat = tl.load(
-            sum_cache_ptr + offs_m[:, None] * stride_sum_s + blocd_idx[None, :] * stride_sum_c,
-            mask=(offs_m[:, None] < s) & (blocd_idx[None, :] < C_BLOCK),
+            sum_cache_ptr + offs_m[:, None] * stride_sum_s + block_idx[None, :] * stride_sum_c,
+            mask=(offs_m[:, None] < s) & (block_idx[None, :] < C_BLOCK),
             other=0.0,
         )
         globalsum = tl.sum(sumexp_mat * factor, axis=1)
@@ -246,16 +247,16 @@ def _universal_attention_fwd_kernel(
                     mask=(offs_n[:, None] < s) & (offs_d[None, :] < d),
                     other=0.0,
                 )
-                prev_sum = tl.load(
+                prev_mat_sum = tl.load(
                     output_rep_ptr + offs_m[:, None] * stride_output_s + offs_d[None, :] * stride_output_d,
                     mask=(offs_m[:, None] < s) & (offs_d[None, :] < d),
                     other=0.0,
                 )
-                curr_sum = prev_sum + tl.dot(qk_softmax, B_mat, input_precision="ieee")
-                # curr_sum = tl.cast(curr_sum, DTYPE) # Downcast to old datatype
+                curr_mat_sum = prev_mat_sum + tl.dot(qk_softmax, v_mat, input_precision="ieee")
+                # curr_mat_sum = tl.cast(curr_mat_sum, DTYPE) # Downcast to old datatype
                 tl.store(
                     output_rep_ptr + offs_m[:, None] * stride_output_s + offs_d[None, :] * stride_output_d,
-                    curr_sum,
+                    curr_mat_sum,
                     mask=(offs_m[:, None] < s) & (offs_d[None, :] < d),
                 )
         
@@ -266,25 +267,44 @@ def _universal_attention_fwd(q, k, v, src, dest):
     assert n % n_kv == 0, "n needs to be divisible by n_kv"
     rep = n // n_kv
     device = q.device
-    dtype_flag = tl.float16 if A.dtype == torch.float16 else tl.float32
+    dtype_flag = tl.float16 if q.dtype == torch.float16 else tl.float32
     
-    output = torch.empty(b, n, s, d, dtype=q.dtype, device=device)
-    semaphore = torch.zeros(b, n_kv, s, dtype=torch.int32, device=device)
-    cs_cache = torch.empty(b, n_kv, s, dtype=torch.float32, device=device)
+    BLOCK_C = 64
+    BLOCK_D = 64
+    C_BLOCK = triton.cdiv(s, BLOCK_C)
+    D_BLOCK = triton.cdiv(d, BLOCK_D)
 
-    grid = lambda META: (b * n_kv, triton.cdiv(s, META['BLOCK_C']), triton.cdiv(s, META['BLOCK_C']))
+    output = torch.empty(b, n, s, d, dtype=q.dtype, device=device)
+    
+    spinlock = torch.zeros((b, n_kv, C_BLOCK), device=device, dtype=torch.int32)
+    semaphore = torch.zeros((b, n_kv, C_BLOCK), device=device, dtype=torch.int32)
+    sense_rev = torch.zeros((b, n_kv, C_BLOCK), device=device, dtype=torch.int32)
+    cum_cache = torch.empty((b, n_kv, s), device=device, dtype=torch.float32)
+    max_cache = torch.empty((b, n_kv, s, C_BLOCK), device=device, dtype=torch.float32)
+    sum_cache = torch.empty((b, n_kv, s, C_BLOCK), device=device, dtype=torch.float32)
+    
+    # grid = lambda META: (b * n_kv, triton.cdiv(s, META['BLOCK_C']), triton.cdiv(s, META['BLOCK_C']))
+    grid = (b * n_kv, C_BLOCK, C_BLOCK)
 
     _universal_attention_fwd_kernel[grid](
-        q, k, v, src, dest, output, semaphore, cs_cache,
+        q, k, v, src, dest, output, 
+        spinlock, semaphore, sense_rev, 
+        cum_cache, max_cache, sum_cache, 
         b, n_kv, rep, s, d, 
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),                         # (b, n, s, d)
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),                         # (b, n_kv, s, d)
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),                         # (b, n_kv, s, d)
-        src.stride(0), src.stride(1), src.stride(2),                                # (b, n_kv, s)
-        dest.stride(0), dest.stride(1), dest.stride(2),                             # (b, n_kv, s)
-        output.stride(0), output.stride(1), output.stride(2), output.stride(3),     # (b, n, s, d)
-        semaphore.stride(0), semaphore.stride(1), semaphore.stride(2),              # (b, n_kv, s)
-        cs_cache.stride(0), cs_cache.stride(1), cs_cache.stride(2),                 # (b, n_kv, s)
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),                                 # (b, n, s, d)
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),                                 # (b, n_kv, s, d)
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),                                 # (b, n_kv, s, d)
+        src.stride(0), src.stride(1), src.stride(2),                                        # (b, n_kv, s)
+        dest.stride(0), dest.stride(1), dest.stride(2),                                     # (b, n_kv, s)
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),             # (b, n, s, d)
+        spinlock.stride(0), spinlock.stride(1), spinlock.stride(2),                         # (b, n_kv, C_BLOCK)
+        semaphore.stride(0), semaphore.stride(1), semaphore.stride(2),                      # (b, n_kv, C_BLOCK)
+        sense_rev.stride(0), sense_rev.stride(1), sense_rev.stride(2),                      # (b, n_kv, C_BLOCK)
+        cum_cache.stride(0), cum_cache.stride(1), cum_cache.stride(2),                      # (b, n_kv, s)
+        max_cache.stride(0), max_cache.stride(1), max_cache.stride(2), max_cache.stride(3), # (b, n_kv, s, C_BLOCK)
+        sum_cache.stride(0), sum_cache.stride(1), sum_cache.stride(2), max_cache.stride(3), # (b, n_kv, s, C_BLOCK)
+        BLOCK_C=BLOCK_C, BLOCK_D=BLOCK_D, 
+        C_BLOCK=C_BLOCK, D_BLOCK=D_BLOCK,
         DTYPE=dtype_flag,
     )
 
@@ -321,3 +341,13 @@ def _universal_attention_fwd(q, k, v, src, dest):
 
 def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
     return None, None, None, None, None
+
+if __name__ == "__main__":
+    b, n_kv, rep, s, d = 2, 4, 4, 1024, 512
+    q = torch.rand((b, n_kv * rep, s, d), device='cuda')
+    k = torch.rand((b, n_kv, s, d), device='cuda')
+    v = torch.rand((b, n_kv, s, d), device='cuda')
+    src = torch.rand((b, n_kv, s), device='cuda')
+    dest = torch.rand((b, n_kv, s), device='cuda')
+    output = _universal_attention_fwd(q, k, v, src, dest)
+    print(output.shape)
