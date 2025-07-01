@@ -174,9 +174,9 @@ def softmax_matmul_kernel(
     # store local sum of exp into cache
     tl.store(sum_cache_ptr + offs_m * stride_sum_m + pid_n * stride_sum_n, A_sumexp, mask=(offs_m < m))
     
-    tl.atomic_add(semaphore_ptr, 1)
+    tl.atomic_add(semaphore_ptr, 1, sem="release")
     # Don't use atomic read here, or it will prevent other atomic operations
-    while tl.load(semaphore_ptr, mask=True, other=0) < N_BLOCK:
+    while tl.atomic_add(semaphore_ptr, 0, sem="acquire") < N_BLOCK:
         pass
 
     localmax_mat = tl.load(

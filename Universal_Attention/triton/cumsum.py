@@ -51,7 +51,7 @@ def cumsum_kernel(
     acc = tl.cumsum(A_mat, axis=-1)
     curr_sum = tl.sum(A_mat, axis=-1, keep_dims=False) # put the sum into the cache
 
-    while tl.load(spinlock_ptr, mask=True, other=0) < pid_n:
+    while tl.atomic_add(spinlock_ptr, 0, sem="acquire") < pid_n:
         pass
 
     prev_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -66,7 +66,7 @@ def cumsum_kernel(
         curr_sum + prev_sum,
         mask=offs_m < m, 
     )
-    tl.atomic_add(spinlock_ptr, 1)
+    tl.atomic_add(spinlock_ptr, 1, sem="release")
 
     acc = acc + prev_sum[:, None]
 
@@ -107,6 +107,7 @@ def cumsum_triton(A: torch.Tensor) -> torch.Tensor:
         B.stride(0), B.stride(1), B.stride(2), B.stride(3),
         spinlock.stride(0), spinlock.stride(1), spinlock.stride(2), 
         cum_cache.stride(0), cum_cache.stride(1), cum_cache.stride(2), 
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         DTYPE=dtype_flag,
     )
         
