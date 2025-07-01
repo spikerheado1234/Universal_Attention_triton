@@ -35,7 +35,7 @@ class UniversalAttention(Function):
             out[...,i] = out_
             denom[...,i] = denom_
         
-        return output
+        return out, denom
 
     @staticmethod
     def setup_context(ctx, inputs, outputs):

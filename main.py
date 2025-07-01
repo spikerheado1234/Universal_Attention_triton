@@ -3,6 +3,8 @@ from universal_attention_autograd import UniversalAttention as uni_attn_torch
 from universal_attention_autograd import UniversalAttention2 as uni_attn_torch_2
 from universal_attention_autograd import SMVecMatMul
 
+from Universal_Attention.universal_attention import UniversalAttention as uni_attn_triton
+
 def main(config):
     b       = config['batch_size']
     s       = config['seq_len']
@@ -29,20 +31,20 @@ def main(config):
     static_dest = static[1] 
 
     UA_impl = {
-        "pytorch_base": uni_attn_torch.apply,
-        "pytorch_chunked": uni_attn_torch_2.apply,
-        # "triton": uni_attn_triton.apply,
+        "pytorch_1D": uni_attn_torch.apply,
+        "pytorch_2D": uni_attn_torch_2.apply,
+        "triton": uni_attn_triton.apply,
     }
     SMVMM = SMVecMatMul.apply
 
     results = {}
 
-    for key in UA_impl.keys():
+    for key in ("pytorch_1D", "pytorch_2D"):
         kc_          = kc.clone().detach().to(device).requires_grad_()
         vc_          = vc.clone().detach().to(device).requires_grad_()
         static_src_  = static_src.clone().detach().to(device).requires_grad_()
 
-        if key == "pytorch_chunked":
+        if key == "pytorch_2D":
             xq_ = xq.view(b, n_kv, rep, n_c, c, d).clone().detach().to(device).requires_grad_()
             static_dest_ = static_dest.view(b, n_kv, n_c, c).clone().detach().to(device).requires_grad_()
         else:
@@ -59,7 +61,7 @@ def main(config):
         loss = out.pow(2).sum() # some random loss to enable autograd
         loss.backward()
 
-        if key == "pytorch_chunked":
+        if key == "pytorch_2D":
             xq_grad = xq_.grad.view(b, n_kv, rep, s, d).clone().detach().cpu()
             static_dest_grad = static_dest_.grad.view(b, n_kv, s).clone().detach().cpu()
         else:
@@ -69,6 +71,7 @@ def main(config):
         results[key] = {
             'output': output.clone().detach().cpu(),
             'denom': denom.clone().detach().cpu(),
+            'out': out.clone().detach().cpu(),
             'kc.grad': kc_.grad.clone().detach().cpu(),
             'vc.grad': vc_.grad.clone().detach().cpu(),
             'xq.grad': xq_grad,
@@ -78,14 +81,38 @@ def main(config):
 
         del output, denom, kc_, vc_, xq_, static_src_, static_dest_, xq_grad, static_dest_grad
 
+    # Reshape for the triton kernel
+    q = xq.view(b, n_kv * rep, s, d)
+    k = kc.view(b, n_kv, s, d)
+    v = vc.view(b, n_kv, s, d)
+    src = static_src.view(b, n_kv, s)
+    dest = static_dest.view(b, n_kv, s)
+    out = UA_impl['triton'](q, k, v, src, dest)
+    results['triton'] = {
+        # 'output': output.clone().detach().cpu(),
+        # 'denom': denom.clone().detach().cpu(),
+        'out': out.clone().detach().cpu(),
+        # 'kc.grad': kc_.grad.clone().detach().cpu(),
+        # 'vc.grad': vc_.grad.clone().detach().cpu(),
+        # 'xq.grad': xq_grad,
+        # 'static_src.grad': static_src_.grad.clone().detach().cpu(),
+        # 'static_dest.grad': static_dest_grad,
+    }
+
     # Compare results
     print("Check results:")
-    for attr in ['output', 'denom', 'kc.grad', 'vc.grad', 'xq.grad',
-            'static_src.grad', 'static_dest.grad']:
-        r = []
-        for key in results.keys():
-            r.append(results[key][attr])
-        print(f"{attr} max error:", (r[0].float() - r[1].float()).abs().max().item())
+    # for attr in ['output', 'denom', 'out', 'kc.grad', 'vc.grad', 'xq.grad',
+    #         'static_src.grad', 'static_dest.grad']:
+    #     r = []
+    #     for key in results.keys():
+    #         r.append(results[key][attr])
+    #     print(f"{attr} max error:", (r[0].float() - r[1].float()).abs().max().item())
+    r = []
+    for key in results.keys():
+        r.append(results[key]['out'].view(b, n_kv * rep, s, d))
+    print(f"pytorch_1D vs pytorch_2D max error:", (r[0].float() - r[1].float()).abs().max().item())    
+    print(f"pytorch_1D vs triton max error:", (r[0].float() - r[2].float()).abs().max().item())
+
 
 if __name__ == "__main__":
     test_config = {

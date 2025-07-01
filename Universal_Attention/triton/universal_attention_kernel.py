@@ -110,8 +110,8 @@ def _universal_attention_fwd_kernel(
     affinity = tl.log(1.0 - affinity) 
 
     # .triu(1)
-    triu_mask = (offs_n[None, :] >= (offs_m[:, None] - 1))
-    affinity = tl.where(triu_mask, affinity, 0.0)
+    # triu_mask = (offs_m[:, None] < offs_n[None, :])
+    affinity = tl.where((offs_m[:, None] < offs_n[None, :]), affinity, 0.0)
 
     # .cumsum(3)
     spinlock_ptr += pid_b * stride_spl_b + pid_n_kv * stride_spl_n_kv + pid_m * stride_spl_s
@@ -142,16 +142,21 @@ def _universal_attention_fwd_kernel(
     affinity = affinity + prev_sum[:, None]
 
     # .masked_fill(mask.tril(-1), -1e12)
-    tril_mask = (offs_n[None, :] <= (offs_m[:, None] - 1))
-    affinity = tl.where(tril_mask, -1e12, affinity)
+    # tril_mask = (offs_m[:, None] > offs_n[None, :])
+    affinity = tl.where((offs_m[:, None] > offs_n[None, :]), -1e12, affinity)
 
     # Affinity matrix completed here
 
     # k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))
     q_ptr += pid_b * stride_q_b + pid_n_kv * rep * stride_q_n_rep
-    v_ptr += pid_b * stride_v_b + pid_n_kv * rep * stride_v_n_kv
+    v_ptr += pid_b * stride_v_b + pid_n_kv * stride_v_n_kv
     output_ptr += pid_b * stride_output_b + pid_n_kv * rep * stride_output_n_rep
 
+    semaphore_ptr += pid_b * stride_sem_b + pid_n_kv * stride_sem_n_kv + pid_m * stride_sem_s
+    sense_rev_ptr += pid_b * stride_rev_b + pid_n_kv * stride_rev_n_kv + pid_m * stride_rev_s
+    max_cache_ptr += pid_b * stride_max_b + pid_n_kv * stride_max_n_kv
+    sum_cache_ptr += pid_b * stride_sum_b + pid_n_kv * stride_sum_n_kv
+    
     # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
     # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
     for r in range(0, rep):
@@ -241,7 +246,6 @@ def _universal_attention_fwd_kernel(
             d_idx = idx - pid_n 
             if d_idx >= 0 and d_idx < D_BLOCK:
                 offs_d = d_idx * BLOCK_D + tl.arange(0, BLOCK_D)
-                stride_v_s, stride_v_d,
                 v_mat = tl.load(
                     v_ptr + offs_n[:, None] * stride_v_s + offs_d[None, :] * stride_v_d,
                     mask=(offs_n[:, None] < s) & (offs_d[None, :] < d),
@@ -302,14 +306,62 @@ def _universal_attention_fwd(q, k, v, src, dest):
         sense_rev.stride(0), sense_rev.stride(1), sense_rev.stride(2),                      # (b, n_kv, C_BLOCK)
         cum_cache.stride(0), cum_cache.stride(1), cum_cache.stride(2),                      # (b, n_kv, s)
         max_cache.stride(0), max_cache.stride(1), max_cache.stride(2), max_cache.stride(3), # (b, n_kv, s, C_BLOCK)
-        sum_cache.stride(0), sum_cache.stride(1), sum_cache.stride(2), max_cache.stride(3), # (b, n_kv, s, C_BLOCK)
+        sum_cache.stride(0), sum_cache.stride(1), sum_cache.stride(2), sum_cache.stride(3), # (b, n_kv, s, C_BLOCK)
         BLOCK_C=BLOCK_C, BLOCK_D=BLOCK_D, 
         C_BLOCK=C_BLOCK, D_BLOCK=D_BLOCK,
         DTYPE=dtype_flag,
     )
-
+    del spinlock, semaphore, sense_rev, cum_cache, max_cache, sum_cache
     return output
 
+'''
+#################################
+#     Ground Truth Autograd     #
+#################################
+'''
+def universal_attention_forward(q, k, v, src, dest):
+    b, h, l, d = k.shape
+    _, nh, _, _ = q.shape
+    c = 64
+    n = l // c
+    r = nh // h
+
+    kc = k.view(b, h, n, c, d)
+    vc = v.view(b, h, n, c, d)  
+    xq = q.view(b, h, r, l, d)
+    static_src = src.view(b, h, n, c)
+    static_dest = dest.view(b, h, l)
+
+    b,h,r,l,d = xq.shape
+    _,_,n,c,_ = kc.shape
+
+    mask = torch.ones(c,l, dtype=torch.bool, device=xq.device)
+    out = torch.empty(b,h,r,l,d,n, dtype=xq.dtype, device=xq.device)
+    denom = torch.empty(b,h,r,l,n, dtype=xq.dtype, device=xq.device)
+    static_src = static_src.pow(1/3)
+    static_dest = static_dest.pow(1/3)
+    kt = kc.view(b,h,l,d).transpose(-2,-1)  # b h d l
+    for i in range(n):
+        k_ = kc[:,:,i]  # b h c d
+        v_ = vc[:,:,i]  # b h c d
+        static_src_ = static_src[:,:,i]  # b h c
+
+        # Calculate decay matrix
+        affinity = k_.matmul(kt).relu().pow(2/3).float()  # deltanet style decay
+        affinity = affinity * static_src_.unsqueeze(-1) * static_dest.unsqueeze(-2)  # incorporate mamba-style and per-token decay
+        affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())  # b h c l
+        affinity = affinity.triu(i*c+1).cumsum(3)  # Accumulate decay with causal masking
+        affinity = affinity.masked_fill(mask.tril(i*c-1), -1e12)  # Re-mask, with 1s on diagonal
+
+        # Perform actual attention operation
+        score = k_.unsqueeze(2).matmul(xq.transpose(-1,-2)).add(affinity.unsqueeze(2))  # b h r c l
+        denom_ = score.logsumexp(dim=-2)  # b h r l
+        out_ = score.transpose(-1,-2).softmax(dim=-1).to(dtype=xq.dtype).matmul(v_.unsqueeze(2))  # b h r l d
+
+        out[...,i] = out_
+        denom[...,i] = denom_
+    output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
+    return output.reshape(b, nh, l, d)
 
 '''
 #######################################
@@ -343,11 +395,12 @@ def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
     return None, None, None, None, None
 
 if __name__ == "__main__":
-    b, n_kv, rep, s, d = 2, 4, 4, 1024, 512
+    b, n_kv, rep, s, d = 2, 4, 4, 4096, 4096
     q = torch.rand((b, n_kv * rep, s, d), device='cuda')
     k = torch.rand((b, n_kv, s, d), device='cuda')
     v = torch.rand((b, n_kv, s, d), device='cuda')
     src = torch.rand((b, n_kv, s), device='cuda')
     dest = torch.rand((b, n_kv, s), device='cuda')
     output = _universal_attention_fwd(q, k, v, src, dest)
-    print(output.shape)
+    output_ref = universal_attention_forward(q, k, v, src, dest)
+    print(f"Max Error:", (output.float() - output_ref.float()).abs().max().item())    
