@@ -37,9 +37,6 @@ def _universal_attention_fwd_kernel(
     str_out_b, str_out_h, str_out_r, str_out_l, str_out_d, str_out_n_,      # b h r l d n_
     str_denom_b, str_denom_h, str_denom_r, str_denom_l, str_denom_n_,       # b h r l n_
     str_buffer_b, str_buffer_h, str_buffer_n_, str_buffer_c_,               # b h n_ c_
-    # debug
-    debug_arr,
-    str_debug_b, str_debug_h, str_debug_r, str_debug_l, str_debug_n_,       # b h r l n_
     # Meta-parameters
     BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr,    # Block dims
     IDX_J: tl.constexpr, DTYPE: tl.constexpr,
@@ -133,17 +130,12 @@ def _universal_attention_fwd_kernel(
     out_ptr = out + pid_b * str_out_b + pid_h * str_out_h + pid_i * str_out_n_
     out_ptr = out_ptr + offs_block * str_out_l
 
-    debug_ptr = debug_arr + pid_b * str_debug_b + pid_h * str_debug_h + pid_i * str_debug_n_ 
-    debug_ptr = debug_ptr + offs_block * str_debug_l
-
     # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
     # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
     for rep in range(0, r):
         xq_rep_ptr = xq_ptr + rep * str_xq_r
         denom_rep_ptr = denom_ptr + rep * str_denom_r
         out_rep_ptr = out_ptr + rep * str_out_r
-
-        debug_rep_ptr = debug_ptr + rep * str_debug_r
 
         kq = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
         for d_offset in range(0, d, BLOCK_D):
@@ -178,7 +170,7 @@ def _universal_attention_fwd_kernel(
 
         # score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))
         score_softmax = tl.div_rn(tl.trans(score_exp), score_sumexp[:, None])
-        score_softmax = tl.cast(score_softmax, DTYPE) # b h r _c c_
+        score_softmax = tl.cast(score_softmax, DTYPE) 
         
         for d_offset in range(0, d, BLOCK_D):
             offs_d = d_offset + tl.arange(0, BLOCK_D)
@@ -216,20 +208,17 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
     '''    
     b,h,r,_n,_c,d = xq.shape
     _,_,n_,c_,_ = kc.shape
-    l = n_ * c_
+    l = n_*c_
     dtype = tl.float16 if xq.dtype == torch.float16 else tl.float32
 
     out = torch.empty(b,h,r,l,d,n_, dtype=xq.dtype, device=xq.device)
     denom = torch.empty(b,h,r,l,n_, dtype=xq.dtype, device=xq.device)
     sum_buffer = torch.empty(b,h,n_,c_, dtype=static_src.dtype, device=static_src.device)
 
-    # debug
-    debug = torch.empty(b,h,r,l,n_, dtype=xq.dtype, device=xq.device)
-
     kt = kc.view(b,h,_n,_c,d).permute(0,1,4,2,3)  # b h d _n _c
 
     # Due to the sum buffer for cumulative sum, we want to process that dimension sequencially
-    grid = (b, h, n_)
+    grid = (b,h,n_)
 
     for j in range(_n):
         _universal_attention_fwd_kernel[grid](
@@ -244,12 +233,9 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
             out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4), out.stride(5), 
             denom.stride(0), denom.stride(1), denom.stride(2), denom.stride(3), denom.stride(4), 
             sum_buffer.stride(0), sum_buffer.stride(1), sum_buffer.stride(2), sum_buffer.stride(3),
-            # DEBUG
-            debug, 
-            debug.stride(0), debug.stride(1), debug.stride(2), debug.stride(3), debug.stride(4), 
             BLOCK_R=_c, BLOCK_C=c_, IDX_J=j, DTYPE=dtype, 
         )
-    return out, denom, debug
+    return out, denom
 
 '''
 #################################
@@ -283,8 +269,6 @@ def universal_attention_forward(kc, vc, xq, static_src, static_dest):
     static_src = static_src.pow(1/3)
     static_dest = static_dest.pow(1/3)
     kt = kc.view(b,h,_n,_c,d).permute(0,1,4,2,3)  # b h d _n _c
-
-    debug = torch.empty(b,h,r,l,n_, dtype=xq.dtype, device=xq.device)
     
     # Iteration over columns
     for i in range(n_):
@@ -313,10 +297,9 @@ def universal_attention_forward(kc, vc, xq, static_src, static_dest):
             _denom_ = score.logsumexp(dim=-2)  # b h r _c
             _out_ = score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))  # b h r _c d
 
-            debug[:,:,:,j*_c:(j+1)*_c,i] = torch.exp(_denom_)
             out[:,:,:,j*_c:(j+1)*_c,:,i] = _out_
             denom[:,:,:,j*_c:(j+1)*_c,i] = _denom_
-    return out, denom, debug
+    return out, denom
 
 
 '''
@@ -360,23 +343,12 @@ if __name__ == "__main__":
     static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
     static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
 
-    out, denom, debug = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
-    out_ref, denom_ref, debug_ref = universal_attention_forward(kc, vc, xq, static_src, static_dest)
+    out, denom = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
+    out_ref, denom_ref = universal_attention_forward(kc, vc, xq, static_src, static_dest)
 
+    # Convert to final output for sanity check
     output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     output_ref = out_ref.mul(denom_ref.softmax(dim=-1).unsqueeze(-2)).sum(-1)
-
-    # count = 0
-    # for arr in (debug, debug_ref):
-    #     arr = np.transpose(arr.cpu().numpy(), (0, 1, 4, 2, 5, 3)).reshape(-1, _c * _n)
-    #     np.savetxt(f"debug{count}.csv", arr, delimiter=",", fmt="%.6f")   
-    #     count += 1
-
-    # count = 0
-    # for arr in (debug, debug_ref):
-    #     arr = arr.cpu().numpy().reshape(-1, n_)
-    #     np.savetxt(f"debug{count}.csv", arr, delimiter=",", fmt="%.6f")   
-    #     count += 1
 
     # count = 0
     # for arr in (denom, denom_ref):
@@ -396,10 +368,10 @@ if __name__ == "__main__":
     #     np.savetxt(f"output{count}.csv", arr, delimiter=",", fmt="%.6f")   
     #     count += 1
 
-    # print("Checking debug:")
-    # torch.testing.assert_close(debug, debug_ref, atol=1e-3, rtol=1e-5)
     print("Checking denom:")
     torch.testing.assert_close(denom, denom_ref, atol=1e-3, rtol=1e-5)
+    print("Checking out:")
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-5)
     print("Checking output:")
     torch.testing.assert_close(output, output_ref, atol=1e-3, rtol=1e-5)
 
