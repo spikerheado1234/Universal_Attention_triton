@@ -4,6 +4,7 @@ import triton.language as tl
 
 import numpy as np
 import inspect
+import time
 
 configs = [
     triton.Config({'BLOCK_D': BLOCK_D}, num_stages=stages, num_warps=warps) \
@@ -343,6 +344,42 @@ if __name__ == "__main__":
     static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
     static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
 
+    warm_up = 10
+    for _ in range(warm_up):
+        _, _ = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
+        _, _ = universal_attention_forward(kc, vc, xq, static_src, static_dest)
+
+    print("Checking running time...")
+    n = 1000
+    triton_time, torch_time = 0, 0
+    for _ in range(n):
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
+
+        start_time = time.time()
+        _, _ = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
+        triton_time += time.time() - start_time
+
+        start_time = time.time()
+        _, _ = universal_attention_forward(kc, vc, xq, static_src, static_dest)
+        torch_time += time.time() - start_time
+
+        del kc, vc, xq, static_src, static_dest
+
+    print(f"Triton kernel time: {triton_time}")
+    print(f"Pytorch kernel time: {torch_time}")
+
+    print("Checking closeness to ground truth...")
+
+    kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
+    vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
+    xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
+    static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
+    static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
+
     out, denom = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
     out_ref, denom_ref = universal_attention_forward(kc, vc, xq, static_src, static_dest)
 
@@ -350,29 +387,12 @@ if __name__ == "__main__":
     output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     output_ref = out_ref.mul(denom_ref.softmax(dim=-1).unsqueeze(-2)).sum(-1)
 
-    # count = 0
-    # for arr in (denom, denom_ref):
-    #     arr = arr.cpu().numpy().reshape(-1, n_)
-    #     np.savetxt(f"denom{count}.csv", arr, delimiter=",", fmt="%.6f")   
-    #     count += 1
-
-    # count = 0
-    # for arr in (out, out_ref):
-    #     arr = arr.cpu().numpy().reshape(-1, n_ * d)
-    #     np.savetxt(f"out{count}.csv", arr, delimiter=",", fmt="%.6f")   
-    #     count += 1
-
-    # count = 0
-    # for arr in (output, output_ref):
-    #     arr = arr.cpu().numpy().reshape(-1, d)
-    #     np.savetxt(f"output{count}.csv", arr, delimiter=",", fmt="%.6f")   
-    #     count += 1
-
     print("Checking denom:")
     torch.testing.assert_close(denom, denom_ref, atol=1e-3, rtol=1e-5)
     print("Checking out:")
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-5)
     print("Checking output:")
     torch.testing.assert_close(output, output_ref, atol=1e-3, rtol=1e-5)
+
 
 
