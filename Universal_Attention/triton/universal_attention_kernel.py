@@ -25,7 +25,7 @@ configs = [
 @triton.jit
 def _universal_attention_fwd_kernel(
     # Pointers to matrices
-    kc, vc, xq, kt, src, dest, out, denom, buffer,                               
+    kc, vc, xq, kt, src, dest, out, denom,                                
     # Matrix dimensions
     b, h, r, n_, _n, d, 
     # Strides
@@ -37,7 +37,6 @@ def _universal_attention_fwd_kernel(
     str_dest_b, str_dest_h, str_dest__n, str_dest__c,                       # b h _n _c
     str_out_b, str_out_h, str_out_r, str_out_l, str_out_d, str_out_n_,      # b h r l d n_
     str_denom_b, str_denom_h, str_denom_r, str_denom_l, str_denom_n_,       # b h r l n_
-    str_buffer_b, str_buffer_h, str_buffer_n_, str_buffer_c_,               # b h n_ c_
     # Meta-parameters
     BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_D: tl.constexpr,    # Block dims
     DTYPE: tl.constexpr,
@@ -116,17 +115,8 @@ def _universal_attention_fwd_kernel(
         # .triu(i*c_-j*_c+1)
         affinity = tl.where((offs_j[None, :] > (offs_i[:, None] + offs_tri)), affinity, 0.0)
 
-        # Update sum buffer 
-        curr_sum = tl.sum(affinity, axis=1, keep_dims=False) 
-        # buffer_ptr = buffer + pid_b * str_buffer_b + pid_h * str_buffer_h + pid_i * str_buffer_n_ 
-        # if pid_j == 0:
-        #     # Initialize buffer to 0s
-        #     prev_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
-        # else:
-        #     prev_sum = tl.load(buffer_ptr + offs_i * str_buffer_c_, mask=offs_i < BLOCK_C, other=0.0) 
-        # tl.store(buffer_ptr + offs_i * str_buffer_c_, curr_sum + prev_sum, mask=offs_i < BLOCK_C)
-
         # .cumsum(3)
+        curr_sum = tl.sum(affinity, axis=1, keep_dims=False) 
         affinity = tl.cumsum(affinity, axis=1) + prev_sum[:, None]  
         prev_sum += curr_sum
 
@@ -224,7 +214,6 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
 
     out = torch.empty(b,h,r,l,d,n_, dtype=dtype, device=device)
     denom = torch.empty(b,h,r,l,n_, dtype=dtype, device=device)
-    sum_buffer = torch.empty(b,h,n_,c_, dtype=static_src.dtype, device=device)
 
     kt = kc.view(b,h,_n,_c,d).permute(0,1,4,2,3)  # b h d _n _c
 
@@ -232,7 +221,7 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
     grid = (b,h,n_)
 
     _universal_attention_fwd_kernel[grid](
-        kc, vc, xq, kt, static_src, static_dest, out, denom, sum_buffer,                                                 
+        kc, vc, xq, kt, static_src, static_dest, out, denom,                                                  
         b, h, r, n_, _n, d, 
         kc.stride(0), kc.stride(1), kc.stride(2), kc.stride(3), kc.stride(4),   
         vc.stride(0), vc.stride(1), vc.stride(2), vc.stride(3), vc.stride(4),   
@@ -242,7 +231,6 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
         static_dest.stride(0), static_dest.stride(1), static_dest.stride(2), static_dest.stride(3), 
         out.stride(0), out.stride(1), out.stride(2), out.stride(3), out.stride(4), out.stride(5), 
         denom.stride(0), denom.stride(1), denom.stride(2), denom.stride(3), denom.stride(4), 
-        sum_buffer.stride(0), sum_buffer.stride(1), sum_buffer.stride(2), sum_buffer.stride(3),
         BLOCK_R=_c, BLOCK_C=c_, DTYPE=DTYPE_FLAG, 
     )
 
