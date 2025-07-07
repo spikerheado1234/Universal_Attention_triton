@@ -262,7 +262,7 @@ def _universal_attention_bwd_kernel(
     str_dest_b, str_dest_h, str_dest__n, str_dest__c,                       # b h _n _c
     str_dout_b, str_dout_h, str_dout_r, str_dout_l, str_dout_d, str_dout_n_,# b h r l d n_
     str_ddenom_b, str_ddenom_h, str_ddenom_r, str_ddenom_l, str_ddenom_n_,  # b h r l n_
-    str_dkc_b, str_dkc_h, str_dkc_n_, str_dkc_c_, str_dkc_d,                # b h n_ c_ d
+    str_dkc_b, str_dkc_h, str_dkc_l, str_dkc_d,                             # b h l d
     str_dvc_b, str_dvc_h, str_dvc_n_, str_dvc_c_, str_dvc_d,                # b h n_ c_ d
     str_dxq_b, str_dxq_h, str_dxq_r, str_dxq__n, str_dxq__c, str_dxq_d,     # b h r _n _c d
     str_dsrc_b, str_dsrc_h, str_dsrc_n_, str_dsrc_c_,                       # b h n_ c_
@@ -289,13 +289,27 @@ def _universal_attention_bwd_kernel(
     # Pointers that depend on j
     xq_j = xq + pid_b * str_xq_b + pid_h * str_xq_h
     kt_j = kt + pid_b * str_kt_b + pid_h * str_kt_h 
-    out_j = out + pid_b * str_out_b + pid_h * str_out_h + pid_i * str_out_n_
     dest_j = dest + pid_b * str_dest_b + pid_h * str_dest_h
-    denom_j = denom + pid_b * str_denom_b + pid_h * str_denom_h + pid_i * str_denom_n_ 
     offs_tri_j = pid_i * BLOCK_C
+
+    dkc_ptr = dkc + pid_b * str_dkc_b + pid_h * str_dkc_h 
+    dvc_ptr = dvc + pid_b * str_dvc_b + pid_h * str_dvc_h + pid_i * str_dvc_n_
+    dxq_j = dxq + pid_b * str_dxq_b + pid_h * str_dxq_h
+    dout_j = dout + pid_b * str_dout_b + pid_h * str_dout_h + pid_i * str_dout_n_
+    ddenom_j = ddenom + pid_b * str_ddenom_b + pid_h * str_ddenom_h + pid_i * str_ddenom_n_ 
 
     prev_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
     daff_sum = tl.zeros((BLOCK_C,), dtype=tl.float32) # stores the sum for backward cumsum
+
+    # Clear out output storage first
+    for d_offset in range(0, d, BLOCK_D):
+        offs_d = d_offset + tl.arange(0, BLOCK_D)
+        dvc_mat = tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32)
+        tl.store(
+            dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
+            dvc_mat, 
+            mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
+        )
 
     # First forward pass
     for pid_j in range(0, _n):
@@ -358,15 +372,15 @@ def _universal_attention_bwd_kernel(
 
         # k_.unsqueeze(2).matmul(_q.transpose(-1,-2)).add(affinity.unsqueeze(2))
         xq_ptr = xq_j + pid_j * str_xq__n
-        denom_ptr = denom_j + offs_block * str_denom_l
-        out_ptr = out_j + offs_block * str_out_l
+        ddenom_ptr = ddenom_j + offs_block * str_ddenom_l
+        dout_ptr = dout_j + offs_block * str_dout_l
 
         # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
         # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
         for rep in range(0, r):
             xq_rep_ptr = xq_ptr + rep * str_xq_r
-            denom_rep_ptr = denom_ptr + rep * str_denom_r
-            out_rep_ptr = out_ptr + rep * str_out_r
+            ddenom_rep_ptr = ddenom_ptr + rep * str_ddenom_r 
+            dout_rep_ptr = dout_ptr + rep * str_dout_r
 
             kq = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
             for d_offset in range(0, d, BLOCK_D):
@@ -397,12 +411,57 @@ def _universal_attention_bwd_kernel(
             score_sumexp = tl.sum(score_exp, axis=0)
             score_logsumexp = score_max + tl.log(score_sumexp)
 
-            tl.store(denom_rep_ptr, score_logsumexp, mask=offs_block < BLOCK_R * _n)
+            # tl.store(denom_rep_ptr, score_logsumexp, mask=offs_block < BLOCK_R * _n)
 
             # score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))
-            score_softmax = tl.div_rn(tl.trans(score_exp), score_sumexp[:, None])
+            score_softmax = tl.div_rn(score_exp, score_sumexp[None, :])
             score_softmax = tl.cast(score_softmax, DTYPE) 
             
+            # _dscore = v_.unsqueeze(2).matmul(_dout_.transpose(-1,-2))
+
+            # for d_offset in range(0, d, BLOCK_D):
+            #     offs_d = d_offset + tl.arange(0, BLOCK_D)
+            #     vc_mat = tl.load(
+            #         vc_ptr + offs_i[:, None] * str_vc_c_ + offs_d[None, :] * str_vc_d, 
+            #         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
+            #         other=0.0
+            #     )
+            #     # vc_mat = tl.cast(vc_mat, tl.float32)
+            #     softmax_v = tl.dot(score_softmax, vc_mat, input_precision="ieee")
+
+            #     tl.store(
+            #         out_rep_ptr[:, None] + offs_d[None, :] * str_out_d, 
+            #         softmax_v, 
+            #         mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
+            #     )
+
+            # _dout_ = dout_[:,:,:,j*_c:(j+1)*_c]  # b h r _c d
+            # _ddenom_ = ddenom_[:,:,:,j*_c:(j+1)*_c]  # b h r _c
+
+            # dvc[:,:,i] += _sscore.to(dtype=dvc.dtype).matmul(_dout_).sum(2)  # b h r c_ _c, b h r _c d -> b h c_ d
+            # sum(2) is handled via accumulating over r
+            for d_offset in range(0, d, BLOCK_D):
+                offs_d = d_offset + tl.arange(0, BLOCK_D)
+                dvc_mat = tl.load(
+                    dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
+                    mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
+                    other=0.0
+                )
+                dvc_mat = tl.cast(dvc_mat, tl.float32)
+                dout_mat = tl.load(
+                    dout_rep_ptr[:, None] + offs_d[None, :] * str_dout_d, 
+                    mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
+                    other=0.0
+                )
+                dout_mat = tl.cast(dout_mat, tl.float32)
+                tl.store(
+                    dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
+                    dvc_mat + tl.dot(score_softmax, dout_mat, input_precision="ieee"), 
+                    mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
+                )
+            
+            # _dscore = v_.unsqueeze(2).matmul(_dout_.transpose(-1,-2))  # b h c_ d, b h r _c d -> b h r c_ _c  (from out)
+            dscore_acc = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + tl.arange(0, BLOCK_D)
                 vc_mat = tl.load(
@@ -410,14 +469,25 @@ def _universal_attention_bwd_kernel(
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     other=0.0
                 )
-                # vc_mat = tl.cast(vc_mat, tl.float32)
-                softmax_v = tl.dot(score_softmax, vc_mat, input_precision="ieee")
-
-                tl.store(
-                    out_rep_ptr[:, None] + offs_d[None, :] * str_out_d, 
-                    softmax_v, 
+                vc_mat = tl.cast(vc_mat, tl.float32)
+                dout_mat = tl.load(
+                    dout_rep_ptr[:, None] + offs_d[None, :] * str_dout_d, 
                     mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
+                    other=0.0
                 )
+                dout_mat = tl.cast(dout_mat, tl.float32)
+                dscore_acc += tl.dot(vc_mat, tl.trans(dout_mat), input_precision="ieee")
+
+            # _dscore = _dscore.sub(_dscore.mul(_sscore).sum(-2,True)).mul(_sscore)  # (from softmax)
+            # _dscore += _sscore * _ddenom_.unsqueeze(-2)  # (from denom)
+
+            # # Backprop through q/k matmul
+            # dxq[:,:,:,j] += _dscore.to(dtype=dxq.dtype).transpose(-1,-2).matmul(k_.unsqueeze(2))  # b h r c_ _c, b h c_ d -> b h r _c d
+            # dkc[:,:,i] += _dscore.to(dtype=dkc.dtype).transpose(2,3).flatten(3,4).matmul(_q.flatten(2,3))  # b h r c_ _c, b h r _c d -> b h c_ d
+
+            # # Compute the sum for the backward cumsum
+            # _daff = _dscore.sum(2)  # b h c_ _c
+            # daff_sum += _daff.sum(3)  # b h c_ 
 
     # First forward pass done
 
@@ -457,7 +527,7 @@ def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
     device = xq.device
     DTYPE_FLAG = tl.float16 if dtype == torch.float16 else tl.float32
 
-    dkc = torch.empty(b,h,n_,c_,d, dtype=dtype, device=device)
+    dkc = torch.empty(b,h,l,d, dtype=dtype, device=device)
     dvc = torch.empty(b,h,n_,c_,d, dtype=dtype, device=device)
     dxq = torch.empty(b,h,r,_n,_c,d, dtype=dtype, device=device)
     dstatic_src = torch.empty(b,h,n_,c_, dtype=static_src.dtype, device=device)
@@ -476,7 +546,7 @@ def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
         kc, vc, xq, kt, static_src, static_dest, dout, ddenom,
         dkc, dvc, dxq, dstatic_src, dstatic_dest,
         b, h, r, n_, _n, d, 
-        kc.stride(0), kc.stride(1), kc.stride(2), kc.stride(3), kc.stride(4),   
+        kc.stride(0), kc.stride(1), kc.stride(2), kc.stride(3), kc.stride(4),  
         vc.stride(0), vc.stride(1), vc.stride(2), vc.stride(3), vc.stride(4),   
         xq.stride(0), xq.stride(1), xq.stride(2), xq.stride(3), xq.stride(4), xq.stride(5),  
         kt.stride(0), kt.stride(1), kt.stride(2), kt.stride(3), kt.stride(4),   
@@ -484,13 +554,14 @@ def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
         static_dest.stride(0), static_dest.stride(1), static_dest.stride(2), static_dest.stride(3), 
         dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3), dout.stride(4), dout.stride(5), 
         ddenom.stride(0), ddenom.stride(1), ddenom.stride(2), ddenom.stride(3), ddenom.stride(4), 
-        dkc.stride(0), dkc.stride(1), dkc.stride(2), dkc.stride(3), dkc.stride(4),
+        dkc.stride(0), dkc.stride(1), dkc.stride(2), dkc.stride(3),
         dvc.stride(0), dvc.stride(1), dvc.stride(2), dvc.stride(3), dvc.stride(4), 
         dxq.stride(0), dxq.stride(1), dxq.stride(2), dxq.stride(3), dxq.stride(4), dxq.stride(5),
         dstatic_src.stride(0), dstatic_src.stride(1), dstatic_src.stride(2), dstatic_src.stride(3), 
         dstatic_dest.stride(0), dstatic_dest.stride(1), dstatic_dest.stride(2), dstatic_dest.stride(3), 
         BLOCK_R=_c, BLOCK_C=c_, DTYPE=DTYPE_FLAG, 
     )
+    dkc = dkc.view(b,h,n_,c_,d)
 
     return dkc, dvc, dxq, dstatic_src, dstatic_dest
 
@@ -676,7 +747,7 @@ def universal_attention_backward_single_direction(kc, vc, xq, static_src, static
             _daff_cs = _daff.cumsum(3)  # (from cumsum)
             _daff_cs += dsum_buffer.unsqueeze(-1)   # Accumulate across row chunks
             dsum_buffer = _daff_cs[:,:,:,-1].clone()  # Cloning prevents subsequent _aff2 calcs from changing buffer values                
-            _daff = daff_sum.unsqueeze(-1) - _daff_cs + _daff
+            _daff += daff_sum.unsqueeze(-1) - _daff_cs
             _daff = _daff.triu(i*c_-j*_c+1)  # Prevent accumulation into masked regions
 
             _daff /= _aff2.clamp(min=1e-6, max=1-1e-6) - 1  # ( from ln(1-x) )
@@ -790,6 +861,7 @@ def universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, dden
             _daff += sum_buffer.unsqueeze(-1)  # Accumulate across row chunks
             _daff = _daff.triu(i*c_-j*_c+1)  # Prevent accumulation into masked regions
             sum_buffer = _daff[:,:,:,0].clone()  # Cloning prevents subsequent _aff2 calcs from changing buffer values                
+            
             _daff /= _aff2.clamp(min=1e-6, max=1-1e-6) - 1  # ( from ln(1-x) )
             _daff *= _aff2.le(1-1e-6)
             _dstat = _daff.mul(_aff1.relu().pow(2/3)).to(dtype=static_src.dtype)  # b h c_ _c
@@ -810,12 +882,12 @@ def universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, dden
 
 
 if __name__ == "__main__":
-    # b, h, r, n_, c_, _n, _c, d = 1, 1, 1, 4, 16, 4, 16, 32
-    b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
+    b, h, r, n_, c_, _n, _c, d = 1, 1, 1, 4, 16, 4, 16, 32
+    # b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
 
     # test = "forward"
-    test = "backward"
-    # test = "quick"
+    # test = "backward"
+    test = "quick"
 
     if test == "forward":
         print("Testing forward pass")
@@ -925,7 +997,7 @@ if __name__ == "__main__":
         dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
         ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
 
-        dkc, dvc, dxq, dstat_src, dstat_dest = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
+        dkc, dvc, dxq, dstat_src, dstat_dest = universal_attention_backward_single_direction(kc, vc, xq, static_src, static_dest, dout, ddenom)
         dkc_ref, dvc_ref, dxq_ref, dstat_src_ref, dstat_dest_ref = universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, ddenom)
 
         print("Checking dkc:")
@@ -948,16 +1020,24 @@ if __name__ == "__main__":
         dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
         ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
 
-        dkc, dvc, dxq, dstat_src, dstat_dest = universal_attention_backward_single_direction(kc, vc, xq, static_src, static_dest, dout, ddenom)
+        dkc, dvc, dxq, dstat_src, dstat_dest = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
         dkc_ref, dvc_ref, dxq_ref, dstat_src_ref, dstat_dest_ref = universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, ddenom)
 
-        print("Checking dkc:")
-        torch.testing.assert_close(dkc, dkc_ref, atol=1e-3, rtol=1e-5)
+        # print("Checking dkc:")
+        # torch.testing.assert_close(dkc, dkc_ref, atol=1e-3, rtol=1e-5)
+        
+        count = 0
+        for arr in (dvc, dvc_ref):
+            arr = arr.cpu().numpy().reshape(-1, d)
+            np.savetxt(f"dvc{count}.csv", arr, delimiter=",", fmt="%.6f")   
+            count += 1
+
         print("Checking dvc:")
         torch.testing.assert_close(dvc, dvc_ref, atol=1e-3, rtol=1e-5)
-        print("Checking dxq:")
-        torch.testing.assert_close(dxq, dxq_ref, atol=1e-3, rtol=1e-5)
-        print("Checking dstat_src:")
-        torch.testing.assert_close(dstat_src, dstat_src_ref, atol=1e-3, rtol=1e-5)
-        print("Checking dstat_dest:")
-        torch.testing.assert_close(dstat_dest, dstat_dest_ref, atol=1e-3, rtol=1e-5)
+        # print("Checking dxq:")
+        # torch.testing.assert_close(dxq, dxq_ref, atol=1e-3, rtol=1e-5)
+        # print("Checking dstat_src:")
+        # torch.testing.assert_close(dstat_src, dstat_src_ref, atol=1e-3, rtol=1e-5)
+        # print("Checking dstat_dest:")
+        # torch.testing.assert_close(dstat_dest, dstat_dest_ref, atol=1e-3, rtol=1e-5)
+                                                                   
