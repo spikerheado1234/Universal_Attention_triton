@@ -1040,4 +1040,3 @@ if __name__ == "__main__":
         # torch.testing.assert_close(dstat_src, dstat_src_ref, atol=1e-3, rtol=1e-5)
         # print("Checking dstat_dest:")
         # torch.testing.assert_close(dstat_dest, dstat_dest_ref, atol=1e-3, rtol=1e-5)
-                                                                   
