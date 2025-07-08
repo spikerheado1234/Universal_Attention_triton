@@ -8,8 +8,8 @@ import time
 
 configs = [
     triton.Config({'BLOCK_D': BLOCK_D}, num_stages=stages, num_warps=warps) \
-    for BLOCK_D in [32, 64, 128]\
-    for stages in [2, 3, 4]\
+    for BLOCK_D in [16, 32, 64]\
+    for stages in [1, 2, 3]\
     for warps in [2, 4, 8]\
 ]
 
@@ -95,11 +95,8 @@ def _universal_attention_fwd_kernel(
             # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
             affinity += tl.dot(kc_mat, kt_mat, input_precision="ieee")
 
-        # .relu()
-        affinity = tl.maximum(affinity, 0.0)
-
-        # .pow(2/3)
-        affinity = tl.exp2(tl.log2(affinity) * 2.0 / 3.0)
+        # .relu().pow(2/3)
+        affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
 
         # * static_src_.pow(1/3).unsqueeze(-1) * static_dest.pow(1/3).unsqueeze(-2)
         dest_ptr = dest_j + pid_j * str_dest__n
@@ -110,8 +107,7 @@ def _universal_attention_fwd_kernel(
         affinity = affinity * src_mat[:, None] * dest_mat[None, :]
 
         # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-        affinity = tl.clamp(affinity, 0.0, 1.0 - 1e-6)
-        affinity = tl.log(1.0 - affinity) 
+        affinity = tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
 
         # .triu(i*c_-j*_c+1)
         affinity = tl.where((offs_j[None, :] > (offs_i[:, None] + offs_tri)), affinity, 0.0)
@@ -140,6 +136,7 @@ def _universal_attention_fwd_kernel(
             kq = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + offs_k
+
                 kc_mat = tl.load(
                     kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
@@ -166,7 +163,11 @@ def _universal_attention_fwd_kernel(
             score_sumexp = tl.sum(score_exp, axis=0)
             score_logsumexp = score_max + tl.log(score_sumexp)
 
-            tl.store(denom_rep_ptr, score_logsumexp, mask=offs_block < BLOCK_R * _n)
+            tl.store(
+                denom_rep_ptr, 
+                score_logsumexp, 
+                mask=offs_block < BLOCK_R * _n
+            )
 
             # score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))
             score_softmax = tl.div_rn(tl.trans(score_exp), score_sumexp[:, None])
@@ -174,17 +175,16 @@ def _universal_attention_fwd_kernel(
             
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + offs_k
+
                 vc_mat = tl.load(
                     vc_ptr + offs_i[:, None] * str_vc_c_ + offs_d[None, :] * str_vc_d, 
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     other=0.0
                 )
-                # vc_mat = tl.cast(vc_mat, tl.float32)
-                softmax_v = tl.dot(score_softmax, vc_mat, input_precision="ieee")
 
                 tl.store(
                     out_rep_ptr[:, None] + offs_d[None, :] * str_out_d, 
-                    softmax_v, 
+                    tl.dot(score_softmax, vc_mat, input_precision="ieee"), 
                     mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
                 )
 
@@ -211,7 +211,7 @@ def _universal_attention_fwd(kc, vc, xq, static_src, static_dest):
     l = n_*c_
     dtype = xq.dtype
     device = xq.device
-    DTYPE_FLAG = tl.float16 if dtype == torch.float16 else tl.float32
+    DTYPE_FLAG = tl.bfloat16 if dtype == torch.bfloat16 else tl.float32
 
     out = torch.empty(b,h,r,l,d,n_, dtype=dtype, device=device)
     denom = torch.empty(b,h,r,l,n_, dtype=dtype, device=device)
@@ -279,41 +279,45 @@ def _universal_attention_bwd_kernel(
     offs_j = tl.arange(0, BLOCK_R)          # _c
     offs_k = tl.arange(0, BLOCK_D)          # d
 
+    # xx_i: Pointers that depend on i
+    # xx_j: Pointers that depend on j
     kc_i = kc + pid_b * str_kc_b + pid_h * str_kc_h
-    vc_i = vc + pid_b * str_vc_b + pid_h * str_vc_h
-    src_i = src + pid_b * str_src_b + pid_h * str_src_h
-
-    # Pointers that depend on j
-    xq_j = xq + pid_b * str_xq_b + pid_h * str_xq_h
     kt_j = kt + pid_b * str_kt_b + pid_h * str_kt_h 
+    vc_i = vc + pid_b * str_vc_b + pid_h * str_vc_h
+    xq_j = xq + pid_b * str_xq_b + pid_h * str_xq_h
+    src_i = src + pid_b * str_src_b + pid_h * str_src_h
     dest_j = dest + pid_b * str_dest_b + pid_h * str_dest_h
-
-    dxq_j = dxq + pid_b * str_dxq_b + pid_h * str_dxq_h
-    dkc_i = dkc + pid_b * str_dkc_b + pid_h * str_dkc_h 
-    dvc_i = dvc + pid_b * str_dvc_b + pid_h * str_dvc_h
     dout_ij = dout + pid_b * str_dout_b + pid_h * str_dout_h
     ddenom_ij = ddenom + pid_b * str_ddenom_b + pid_h * str_ddenom_h
+
+    dkc_i = dkc + pid_b * str_dkc_b + pid_h * str_dkc_h 
+    dvc_i = dvc + pid_b * str_dvc_b + pid_h * str_dvc_h
+    dxq_j = dxq + pid_b * str_dxq_b + pid_h * str_dxq_h
     dsrc_i = dsrc + pid_b * str_dsrc_b + pid_h * str_dsrc_h
     ddest_j = ddest + pid_b * str_ddest_b + pid_h * str_ddest_h
 
-    # Clear out output storage first
+    # Clear out output tensors first
     for pid_i in range(0, n_):
-        dvc_ptr = dvc_i + pid_i * str_dvc_n_
         dkc_ptr = dkc_i + pid_i * BLOCK_C * str_dkc_l
+        dvc_ptr = dvc_i + pid_i * str_dvc_n_
         dsrc_ptr = dsrc_i + pid_i * str_dsrc_n_ 
         for d_offset in range(0, d, BLOCK_D):
             offs_d = d_offset + offs_k
-            tl.store(
-                dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
-                tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32), 
-                mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
-            )
             tl.store(
                 dkc_ptr + offs_i[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
                 tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32), 
                 mask=(offs_i[:, None] < BLOCK_C * n_) & (offs_d[None, :] < d), 
             ) 
-        tl.store(dsrc_ptr + offs_i * str_dsrc_c_, tl.zeros((BLOCK_C,), dtype=tl.float32), mask=offs_i < BLOCK_C)
+            tl.store(
+                dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
+                tl.zeros((BLOCK_C, BLOCK_D), dtype=tl.float32), 
+                mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
+            )
+        tl.store(
+            dsrc_ptr + offs_i * str_dsrc_c_, 
+            tl.zeros((BLOCK_C,), dtype=tl.float32), 
+            mask=offs_i < BLOCK_C,
+        )
 
     for pid_j in range(0, _n):
         dxq_ptr = dxq_j + pid_j * str_dxq__n
@@ -327,22 +331,29 @@ def _universal_attention_bwd_kernel(
                     tl.zeros((BLOCK_R, BLOCK_D), dtype=tl.float32),
                     mask=(offs_j[:, None] < BLOCK_R) & (offs_d[None, :] < d), 
                 )
-        tl.store(ddest_ptr + offs_j * str_ddest__c, tl.zeros((BLOCK_R,), dtype=tl.float32), mask=offs_j < BLOCK_R)
+        tl.store(
+            ddest_ptr + offs_j * str_ddest__c, 
+            tl.zeros((BLOCK_R,), dtype=tl.float32), 
+            mask=offs_j < BLOCK_R,
+        )
 
     for pid_i in range(0, n_):
         kc_ptr = kc_i + pid_i * str_kc_n_ 
         vc_ptr = vc_i + pid_i * str_vc_n_ 
+
         src_ptr = src_i + pid_i * str_src_n_ 
         src_mat = tl.load(src_ptr + offs_i * str_src_c_, mask=offs_i < BLOCK_C, other=0.0)
         src_mat = tl.cast(src_mat, tl.float32)
         src_mat = tl.exp2(tl.log2(src_mat) / 3.0)
-        offs_tri_j = pid_i * BLOCK_C
 
         dkc_ptr = dkc_i + pid_i * BLOCK_C * str_dkc_l 
         dvc_ptr = dvc_i + pid_i * str_dvc_n_
+        dsrc_ptr = dsrc_i + pid_i * str_dsrc_n_ 
+
         dout_j = dout_ij + pid_i * str_dout_n_
         ddenom_j = ddenom_ij + pid_i * str_ddenom_n_ 
-        dsrc_ptr = dsrc_i + pid_i * str_dsrc_n_ 
+        
+        offs_tri_j = pid_i * BLOCK_C
 
         # Clear out sum buffers
         prev_sum = tl.zeros((BLOCK_C,), dtype=tl.float32)
@@ -360,6 +371,7 @@ def _universal_attention_bwd_kernel(
 
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + offs_k
+
                 kc_mat = tl.load(
                     kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
@@ -374,14 +386,10 @@ def _universal_attention_bwd_kernel(
                 )
                 kt_mat = tl.cast(kt_mat, tl.float32)
 
-                # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
                 affinity += tl.dot(kc_mat, kt_mat, input_precision="ieee")
 
-            # .relu()
-            affinity = tl.maximum(affinity, 0.0)
-
-            # .pow(2/3)
-            affinity = tl.exp2(tl.log2(affinity) * 2.0 / 3.0)
+            # .relu().pow(2/3)
+            affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
 
             # * static_src_.pow(1/3).unsqueeze(-1) * static_dest.pow(1/3).unsqueeze(-2)
             dest_ptr = dest_j + pid_j * str_dest__n
@@ -392,8 +400,7 @@ def _universal_attention_bwd_kernel(
             affinity = affinity * src_mat[:, None] * dest_mat[None, :]
 
             # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-            affinity = tl.clamp(affinity, 0.0, 1.0 - 1e-6)
-            affinity = tl.log(1.0 - affinity) 
+            affinity = tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
 
             # .triu(i*c_-j*_c+1)
             affinity = tl.where((offs_j[None, :] > (offs_i[:, None] + offs_tri)), affinity, 0.0)
@@ -411,21 +418,18 @@ def _universal_attention_bwd_kernel(
             xq_ptr = xq_j + pid_j * str_xq__n
             ddenom_ptr = ddenom_j + offs_block * str_ddenom_l
             dout_ptr = dout_j + offs_block * str_dout_l
-                        
             dxq_ptr = dxq_j + pid_j * str_dxq__n
 
-            # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
-            # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
             for rep in range(0, r):
                 xq_rep_ptr = xq_ptr + rep * str_xq_r
                 ddenom_rep_ptr = ddenom_ptr + rep * str_ddenom_r 
                 dout_rep_ptr = dout_ptr + rep * str_dout_r
-
                 dxq_rep_ptr = dxq_ptr + rep * str_dxq_r
 
                 kq = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
                 for d_offset in range(0, d, BLOCK_D):
                     offs_d = d_offset + offs_k
+
                     kc_mat = tl.load(
                         kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
@@ -440,7 +444,6 @@ def _universal_attention_bwd_kernel(
                     )
                     xq_mat = tl.cast(xq_mat, tl.float32)
 
-                    # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
                     kq += tl.dot(kc_mat,tl.trans(xq_mat), input_precision="ieee")
 
                 score = kq + affinity
@@ -452,26 +455,28 @@ def _universal_attention_bwd_kernel(
                 score_sumexp = tl.sum(score_exp, axis=0)
                 score_logsumexp = score_max + tl.log(score_sumexp)
 
-                # score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))
+                # score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype)
                 score_softmax = tl.div_rn(score_exp, score_sumexp[None, :])
-                score_softmax = tl.cast(score_softmax, DTYPE) 
 
                 # _dscore = v_.unsqueeze(2).matmul(_dout_.transpose(-1,-2))  # b h c_ d, b h r _c d -> b h r c_ _c  (from out)
                 dscore_acc = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
                 for d_offset in range(0, d, BLOCK_D):
                     offs_d = d_offset + offs_k
+
                     vc_mat = tl.load(
                         vc_ptr + offs_i[:, None] * str_vc_c_ + offs_d[None, :] * str_vc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                         other=0.0
                     )
                     vc_mat = tl.cast(vc_mat, tl.float32)
+
                     dout_mat = tl.load(
                         dout_rep_ptr[:, None] + offs_d[None, :] * str_dout_d, 
                         mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
                         other=0.0
                     )
                     dout_mat = tl.cast(dout_mat, tl.float32)
+
                     dscore_acc += tl.dot(vc_mat, tl.trans(dout_mat), input_precision="ieee")
                 
                 # _dscore = _dscore.sub(_dscore.mul(_sscore).sum(-2,True)).mul(_sscore)  # (from softmax)
@@ -481,7 +486,7 @@ def _universal_attention_bwd_kernel(
                 _dscore += score_softmax * ddenom_mat[None, :]
                 
                 # Compute the sum for the backward cumsum
-                # _daff = _dscore.sum(2)  # b h c_ _c
+                # _daff = _dscore.sum(2)  # b h c_ _c, handled via accumulating over r
                 # daff_sum += _daff.sum(3)  # b h c_ 
                 daff_sum += tl.sum(_dscore, axis=1)
 
@@ -489,24 +494,21 @@ def _universal_attention_bwd_kernel(
                     offs_d = d_offset + offs_k
 
                     # dvc[:,:,i] += _sscore.to(dtype=dvc.dtype).matmul(_dout_).sum(2)  # b h r c_ _c, b h r _c d -> b h c_ d
-                    # sum(2) is handled via accumulating over r
                     dvc_mat = tl.load(
                         dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                         other=0.0
                     )
-                    dvc_mat = tl.cast(dvc_mat, tl.float32)
 
                     dout_mat = tl.load(
                         dout_rep_ptr[:, None] + offs_d[None, :] * str_dout_d, 
                         mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
                         other=0.0
                     )
-                    dout_mat = tl.cast(dout_mat, tl.float32)
 
                     tl.store(
                         dvc_ptr + offs_i[:, None] * str_dvc_c_ + offs_d[None, :] * str_dvc_d, 
-                        dvc_mat + tl.dot(score_softmax, dout_mat, input_precision="ieee"), 
+                        dvc_mat + tl.dot(tl.cast(score_softmax, DTYPE), dout_mat, input_precision="ieee"), 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     )
 
@@ -516,7 +518,6 @@ def _universal_attention_bwd_kernel(
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                         other=0.0
                     )
-                    kc_mat = tl.cast(kc_mat, tl.float32)
 
                     dxq_mat = tl.load(
                         dxq_rep_ptr + offs_j[:, None] * str_dxq__c + offs_d[None, :] * str_dxq_d, 
@@ -526,28 +527,26 @@ def _universal_attention_bwd_kernel(
 
                     tl.store(
                         dxq_rep_ptr + offs_j[:, None] * str_dxq__c + offs_d[None, :] * str_dxq_d, 
-                        dxq_mat + tl.dot(tl.trans(_dscore), kc_mat, input_precision="ieee"),
+                        dxq_mat + tl.dot(tl.trans(tl.cast(_dscore, DTYPE)), kc_mat, input_precision="ieee"),
                         mask=(offs_j[:, None] < BLOCK_R) & (offs_d[None, :] < d), 
                     )
-                    # @Haochen: I'm here!
+
                     # dkc[:,:,i] += _dscore.to(dtype=dkc.dtype).transpose(2,3).flatten(3,4).matmul(_q.flatten(2,3))  # b h r c_ _c, b h r _c d -> b h c_ d
                     dkc_mat = tl.load(
                         dkc_ptr + offs_i[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                         other=0.0
                     )
-                    dkc_mat = tl.cast(dkc_mat, tl.float32)
 
                     xq_mat = tl.load(
                         xq_rep_ptr + offs_j[:, None] * str_xq__c + offs_d[None, :] * str_xq_d, 
                         mask=(offs_j[:, None] < BLOCK_R) & (offs_d[None, :] < d), 
                         other=0.0
                     )
-                    xq_mat = tl.cast(xq_mat, tl.float32)
 
                     tl.store(
                         dkc_ptr + offs_i[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
-                        dkc_mat + tl.dot(_dscore, xq_mat, input_precision="ieee"),
+                        dkc_mat + tl.dot(tl.cast(_dscore, DTYPE), xq_mat, input_precision="ieee"),
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     )
         # First forward pass done
@@ -560,13 +559,14 @@ def _universal_attention_bwd_kernel(
             offs_block = pid_j * BLOCK_R + offs_j
             ddest_ptr = ddest_j + pid_j * str_ddest__n
 
-            affinity = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
-
             # k_.matmul(_kt)
             kt_ptr = kt_j + pid_j * str_kt__n
 
+            affinity = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
+
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + offs_k
+
                 kc_mat = tl.load(
                     kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
@@ -581,16 +581,12 @@ def _universal_attention_bwd_kernel(
                 )
                 kt_mat = tl.cast(kt_mat, tl.float32)
 
-                # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
                 affinity += tl.dot(kc_mat, kt_mat, input_precision="ieee")
 
             _aff1 = affinity
 
-            # .relu()
-            affinity = tl.maximum(affinity, 0.0)
-
-            # .pow(2/3)
-            affinity = tl.exp2(tl.log2(affinity) * 2.0 / 3.0)
+            # .relu().pow(2/3)
+            affinity = tl.exp2(tl.log2(tl.maximum(affinity, 0.0)) * 2.0 / 3.0)
 
             # * static_src_.pow(1/3).unsqueeze(-1) * static_dest.pow(1/3).unsqueeze(-2)
             dest_ptr = dest_j + pid_j * str_dest__n
@@ -603,8 +599,7 @@ def _universal_attention_bwd_kernel(
             _aff2 = affinity
 
             # torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-            affinity = tl.clamp(affinity, 0.0, 1.0 - 1e-6)
-            affinity = tl.log(1.0 - affinity) 
+            affinity = tl.log(1.0 - tl.clamp(affinity, 0.0, 1.0 - 1e-6)) 
 
             # .triu(i*c_-j*_c+1)
             affinity = tl.where((offs_j[None, :] > (offs_i[:, None] + offs_tri)), affinity, 0.0)
@@ -622,23 +617,21 @@ def _universal_attention_bwd_kernel(
             xq_ptr = xq_j + pid_j * str_xq__n
             ddenom_ptr = ddenom_j + offs_block * str_ddenom_l
             dout_ptr = dout_j + offs_block * str_dout_l
-                        
             dxq_ptr = dxq_j + pid_j * str_dxq__n
 
             _daff = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
 
-            # @Haochen: storing a 3D tensor after applying .dot() to 3D tensors would fail LLVM compilation
-            # The problem is fixed in triton 3.2.0, and the alternative code is listed in matmul.py
             for rep in range(0, r):
                 xq_rep_ptr = xq_ptr + rep * str_xq_r
                 ddenom_rep_ptr = ddenom_ptr + rep * str_ddenom_r 
                 dout_rep_ptr = dout_ptr + rep * str_dout_r
-
                 dxq_rep_ptr = dxq_ptr + rep * str_dxq_r
 
                 kq = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
+
                 for d_offset in range(0, d, BLOCK_D):
                     offs_d = d_offset + offs_k
+
                     kc_mat = tl.load(
                         kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
@@ -653,7 +646,6 @@ def _universal_attention_bwd_kernel(
                     )
                     xq_mat = tl.cast(xq_mat, tl.float32)
 
-                    # Use ieee to use fp32, otherwise the default would be tf32 even after tl.cast
                     kq += tl.dot(kc_mat,tl.trans(xq_mat), input_precision="ieee")
 
                 score = kq + affinity
@@ -671,20 +663,24 @@ def _universal_attention_bwd_kernel(
 
                 # _dscore = v_.unsqueeze(2).matmul(_dout_.transpose(-1,-2))  # b h c_ d, b h r _c d -> b h r c_ _c  (from out)
                 dscore_acc = tl.zeros((BLOCK_C, BLOCK_R), dtype=tl.float32)
+
                 for d_offset in range(0, d, BLOCK_D):
                     offs_d = d_offset + offs_k
+
                     vc_mat = tl.load(
                         vc_ptr + offs_i[:, None] * str_vc_c_ + offs_d[None, :] * str_vc_d, 
                         mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                         other=0.0
                     )
                     vc_mat = tl.cast(vc_mat, tl.float32)
+
                     dout_mat = tl.load(
                         dout_rep_ptr[:, None] + offs_d[None, :] * str_dout_d, 
                         mask=(offs_block[:, None] < BLOCK_R * _n) & (offs_d[None, :] < d), 
                         other=0.0
                     )
                     dout_mat = tl.cast(dout_mat, tl.float32)
+
                     dscore_acc += tl.dot(vc_mat, tl.trans(dout_mat), input_precision="ieee")
                 
                 # _dscore = _dscore.sub(_dscore.mul(_sscore).sum(-2,True)).mul(_sscore)  # (from softmax)
@@ -703,7 +699,6 @@ def _universal_attention_bwd_kernel(
             curr_dsum = tl.sum(_daff, axis=1, keep_dims=False) 
             _daff_cs = tl.cumsum(_daff, axis=1) + prev_dsum[:, None]  
             prev_dsum += curr_dsum
-
             # _daff += daff_sum.unsqueeze(-1) - _daff_cs
             _daff = daff_sum[:, None] - _daff_cs + _daff
 
@@ -724,39 +719,48 @@ def _universal_attention_bwd_kernel(
             # dstat_src[:,:,i] += _dstat.mul(_static_dest.unsqueeze(-2)).sum(-1).div(static_src_.pow(2).mul(3))  # b h c_ _c, b h _c -> b h c_
             dsrc_mat = tl.load(dsrc_ptr + offs_i * str_dsrc_c_, mask=offs_i < BLOCK_C, other=0.0)
             dsrc_mat += tl.div_rn(tl.sum(_dstat * dest_mat[None, :], axis=1), tl.exp2(tl.log2(src_mat) * 2.0) * 3.0)
-            tl.store(dsrc_ptr + offs_i * str_dsrc_c_, dsrc_mat, mask=offs_i < BLOCK_C)
+            tl.store(
+                dsrc_ptr + offs_i * str_dsrc_c_, 
+                dsrc_mat, 
+                mask=offs_i < BLOCK_C
+            )
 
             # dstat_dest[:,:,j] += _dstat.mul(static_src_.unsqueeze(-1)).sum(-2).div(_static_dest.pow(2).mul(3))  # b h c_ _c, b h c_ -> b h _c
             ddest_mat = tl.load(ddest_ptr + offs_j * str_ddest__c, mask=offs_j < BLOCK_R, other=0.0)
             ddest_mat += tl.div_rn(tl.sum(_dstat * src_mat[:, None], axis=0), tl.exp2(tl.log2(dest_mat) * 2.0) * 3.0)
-            tl.store(ddest_ptr + offs_j * str_ddest__c, ddest_mat, mask=offs_j < BLOCK_R)
+            tl.store(
+                ddest_ptr + offs_j * str_ddest__c, 
+                ddest_mat, 
+                mask=offs_j < BLOCK_R
+            )
 
             # # Backprop into k/k matmul
             # _daff *= static_src_.unsqueeze(-1) * _static_dest.unsqueeze(-2)  # (from prod with statics)
             _daff = _daff * src_mat[:, None] * dest_mat[None, :]
             
             # _daff = _daff.to(dtype=_q.dtype) * _aff1.abs().add(1e-9).pow(-1/3).mul(2/3).mul(_aff1.gt(0))  # (from relu and pow)
-            _daff = tl.cast(_daff, tl.float32) * tl.exp2( - tl.log2((tl.abs(_aff1) + 1e-9)) / 3.0) * (2.0 / 3.0)
+            _daff *= tl.exp2(-tl.log2((tl.abs(_aff1) + 1e-9)) / 3.0) * (2.0 / 3.0)
             _daff = tl.where((_aff1 > 0.0), _daff, 0.0)
+            _daff = tl.cast(_daff, DTYPE)
 
             for d_offset in range(0, d, BLOCK_D):
                 offs_d = d_offset + offs_k
-                dkc_j_ptr = dkc_i + pid_j * BLOCK_R * str_dkc_l 
 
                 # dkc[:,:,j*_c:(j+1)*_c] += _daff.transpose(-1,-2).matmul(k_)  # b h c_ _c, b h c_ d -> b h _c d
+                dkc_j_ptr = dkc_i + pid_j * BLOCK_R * str_dkc_l 
                 dkc_j_mat = tl.load(
                     dkc_j_ptr + offs_j[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
                     mask=(offs_j[:, None] < BLOCK_R) & (offs_d[None, :] < d), 
                     other=0.0
                 )
-                dkc_j_mat = tl.cast(dkc_j_mat, tl.float32)
+                # dkc_j_mat = tl.cast(dkc_j_mat, tl.float32)
                 
                 kc_mat = tl.load(
                     kc_ptr + offs_i[:, None] * str_kc_c_ + offs_d[None, :] * str_kc_d, 
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     other=0.0
                 )
-                kc_mat = tl.cast(kc_mat, tl.float32)
+                # kc_mat = tl.cast(kc_mat, tl.float32)
 
                 tl.store(
                     dkc_j_ptr + offs_j[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
@@ -770,22 +774,20 @@ def _universal_attention_bwd_kernel(
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                     other=0.0
                 )
-                dkc_mat = tl.cast(dkc_mat, tl.float32)
+                # dkc_mat = tl.cast(dkc_mat, tl.float32)
 
                 kt_mat = tl.load(
                     kt_ptr + offs_d[:, None] * str_kt_d + offs_j[None, :] * str_kt__c, 
                     mask=(offs_d[:, None] < d) & (offs_j[None, :] < BLOCK_R), 
                     other=0.0
                 )
-                kt_mat = tl.cast(kt_mat, tl.float32)
+                # kt_mat = tl.cast(kt_mat, tl.float32)
 
                 tl.store(
                     dkc_ptr + offs_i[:, None] * str_dkc_l + offs_d[None, :] * str_dkc_d, 
                     dkc_mat + tl.dot(_daff, tl.trans(kt_mat), input_precision="ieee"),
                     mask=(offs_i[:, None] < BLOCK_C) & (offs_d[None, :] < d), 
                 )
-
-
 
 def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
     '''
@@ -817,7 +819,7 @@ def _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom):
     l = n_*c_
     dtype = xq.dtype
     device = xq.device
-    DTYPE_FLAG = tl.float16 if dtype == torch.float16 else tl.float32
+    DTYPE_FLAG = tl.bfloat16 if dtype == torch.bfloat16 else tl.float32
 
     dkc = torch.empty(b,h,l,d, dtype=dtype, device=device)
     dvc = torch.empty(b,h,n_,c_,d, dtype=dtype, device=device)
@@ -1176,20 +1178,21 @@ def universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, dden
 
 
 if __name__ == "__main__":
-    b, h, r, n_, c_, _n, _c, d = 1, 1, 1, 4, 16, 4, 16, 32
-    # b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
+    # b, h, r, n_, c_, _n, _c, d = 1, 1, 1, 4, 16, 4, 16, 32
+    b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
+    dtype = torch.bfloat16
 
     # test = "forward"
-    # test = "backward"
-    test = "quick"
+    test = "backward"
+    # test = "quick"
 
     if test == "forward":
         print("Testing forward pass")
-        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
 
         warm_up = 10
         for _ in range(warm_up):
@@ -1200,11 +1203,11 @@ if __name__ == "__main__":
         n = 1000
         triton_time, torch_time = 0, 0
         for _ in range(n):
-            kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-            vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-            xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-            static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-            static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
+            kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+            vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+            xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+            static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+            static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
 
             start_time = time.time()
             _, _ = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
@@ -1221,11 +1224,11 @@ if __name__ == "__main__":
 
         print("Checking closeness to ground truth...")
 
-        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
 
         out, denom = _universal_attention_fwd(kc, vc, xq, static_src, static_dest)
         out_ref, denom_ref = universal_attention_forward(kc, vc, xq, static_src, static_dest)
@@ -1243,33 +1246,33 @@ if __name__ == "__main__":
     
     elif test == "backward":
         print("Testing backward pass")
-        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
-        dout = torch.randn((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
-        ddenom = torch.randn((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
+        dout = torch.randn((b, h, r, n_ * c_, d, n_), device='cuda', dtype=dtype)
+        ddenom = torch.randn((b, h, r, n_ * c_, n_), device='cuda', dtype=dtype)
 
         warm_up = 10
         for _ in range(warm_up):
-            _, _, _, _, _ = universal_attention_backward_single_direction(kc, vc, xq, static_src, static_dest, dout, ddenom)
+            _, _, _, _, _ = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
             _, _, _, _, _ = universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, ddenom)
 
         print("Checking running time...")
         n = 1000
         triton_time, torch_time = 0, 0
         for _ in range(n):
-            kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-            vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-            xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-            static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-            static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
-            dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
-            ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
+            kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+            vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+            xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+            static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+            static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
+            dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=dtype)
+            ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=dtype)
 
             start_time = time.time()
-            _, _, _, _, _ = universal_attention_backward_single_direction(kc, vc, xq, static_src, static_dest, dout, ddenom)
+            _, _, _, _, _ = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
             triton_time += time.time() - start_time
 
             start_time = time.time()
@@ -1283,13 +1286,13 @@ if __name__ == "__main__":
 
         print("Checking closeness to ground truth...")
 
-        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
-        dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
-        ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
+        dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=dtype)
+        ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=dtype)
 
         dkc, dvc, dxq, dstat_src, dstat_dest = universal_attention_backward_single_direction(kc, vc, xq, static_src, static_dest, dout, ddenom)
         dkc_ref, dvc_ref, dxq_ref, dstat_src_ref, dstat_dest_ref = universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, ddenom)
@@ -1306,13 +1309,13 @@ if __name__ == "__main__":
         torch.testing.assert_close(dstat_dest, dstat_dest_ref, atol=1e-3, rtol=1e-5)
 
     else:
-        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=torch.float32)
-        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=torch.float32)
-        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=torch.float32)
-        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=torch.float32)
-        dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=torch.float32)
-        ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=torch.float32)
+        kc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        vc = torch.rand((b, h, n_, c_, d), device='cuda', dtype=dtype)
+        xq = torch.rand((b, h, r, _n, _c, d), device='cuda', dtype=dtype)
+        static_src = torch.rand((b, h, n_, c_), device='cuda', dtype=dtype)
+        static_dest = torch.rand((b, h, _n, _c), device='cuda', dtype=dtype)
+        dout = torch.rand((b, h, r, n_ * c_, d, n_), device='cuda', dtype=dtype)
+        ddenom = torch.rand((b, h, r, n_ * c_, n_), device='cuda', dtype=dtype)
 
         dkc, dvc, dxq, dstat_src, dstat_dest = _universal_attention_bwd(kc, vc, xq, static_src, static_dest, dout, ddenom)
         dkc_ref, dvc_ref, dxq_ref, dstat_src_ref, dstat_dest_ref = universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, ddenom)
