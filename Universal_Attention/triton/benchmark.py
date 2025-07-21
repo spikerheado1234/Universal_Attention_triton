@@ -320,7 +320,8 @@ def universal_attention_backward(kc, vc, xq, static_src, static_dest, dout, dden
 
 if __name__ == "__main__":
     # b, h, r, n_, c_, _n, _c, d = 1, 1, 1, 4, 16, 4, 16, 32
-    b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
+    # b, h, r, n_, c_, _n, _c, d = 2, 4, 2, 32, 64, 32, 64, 512
+    b, h, r, n_, c_, _n, _c, d = 8, 4, 8, 128, 32, 128, 32, 128 # l = n * c = 4096
 
     # test = "forward"
     test = "backward"
