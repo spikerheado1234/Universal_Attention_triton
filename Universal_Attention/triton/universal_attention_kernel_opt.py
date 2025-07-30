@@ -23,7 +23,6 @@ def get_cuda_configs():
         for BLOCK_N in [32, 64, 128, 256]:
             configs.append(triton.Config({"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N}, num_stages=2, num_warps=8))
 
-
     return configs
 
 #@triton.jit
@@ -50,15 +49,13 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     else:
         lo, hi = 0, N_CTX
     offsetk_y = offset_y + lo
-    if dtype == tl.float8e5:
-        offsetv_y = offset_y * HEAD_DIM + lo
-    else:
-        offsetv_y = offset_y + lo
+    offsetv_y = offset_y + lo
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
-        k = desc_k.load([offsetk_y, 0]).T
+        k_ptr = offsetk_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+        k = tl.trans(tl.load(desc_k + k_ptr, mask=tl.arange(0, BLOCK_N)[:, None]*start_n*BLOCK_N < N_CTX, other=0.0))
         qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
@@ -75,10 +72,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # prepare p and v for the dot
-        if dtype == tl.float8e5:
-            v = desc_v.load([0, offsetv_y]).T
-        else:
-            v = desc_v.load([offsetv_y, 0])
+        v_ptr = offsetv_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+        v = tl.load(desc_v + v_ptr, mask=tl.arange(0, BLOCK_N)[:, None]*start_n*BLOCK_N < N_CTX, other=0.0)
         p = p.to(dtype)
         # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
@@ -86,8 +81,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # place this at the end of the loop to reduce register pressure
         l_i = l_i * alpha + l_ij
         m_i = m_ij
-        offsetk_y += BLOCK_N
-        offsetv_y += BLOCK_N
+        offsetk_y += BLOCK_N * HEAD_DIM
+        offsetv_y += BLOCK_N * HEAD_DIM
     return acc, l_i, m_i
 
 @triton.autotune(
@@ -112,21 +107,9 @@ def _attn_fwd(sm_scale, M,  #
     off_h = off_hz % H
 
     y_dim = Z * H * N_CTX
-    #desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-    #                                 block_shape=[BLOCK_M, HEAD_DIM])
-    #if FP8_OUTPUT:
-    #    desc_v = _maybe_make_tensor_desc(desc_v, shape=[HEAD_DIM, y_dim], strides=[N_CTX, 1],
-    #                                     block_shape=[HEAD_DIM, BLOCK_N])
-    #else:
-    #    desc_v = _maybe_make_tensor_desc(desc_v, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-    #                                     block_shape=[BLOCK_N, HEAD_DIM])
-    #desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-    #                                 block_shape=[BLOCK_N, HEAD_DIM])
-    #desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_y = off_z * (N_CTX * H) + off_h * N_CTX
-    qo_offset_y = offset_y + start_m * BLOCK_M
+    offset_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
+    qo_offset_y = offset_y + start_m * BLOCK_M * HEAD_DIM
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -138,7 +121,8 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
-    q = desc_q.load([qo_offset_y, 0])
+    qo_ptr = qo_offset_y + tl.arange(0, BLOCK_M)[:, None] * HEAD_DIM  + tl.arange(0, HEAD_DIM)[None, :]
+    q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < M, other=0.0)
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -160,7 +144,7 @@ def _attn_fwd(sm_scale, M,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    desc_o.store([qo_offset_y, 0], acc.to(dtype))
+    tl.store(desc_o+qo_ptr, acc.to(dtype), mask=tl.arange(0, BLOCK_M)+start_m*BLOCK_M < M)
 
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
