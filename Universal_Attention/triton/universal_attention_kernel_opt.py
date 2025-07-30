@@ -6,6 +6,8 @@ from torch.nn.functional import scaled_dot_product_attention
 import numpy as np
 import inspect
 import time
+from math import sqrt
+import pdb
 
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
@@ -55,25 +57,30 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k_ptr = offsetk_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-        k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)*start_n*BLOCK_N)[:,None] < N_CTX, other=0.0))
+        k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
+        qk *=1/tl.sqrt(tl.cast(HEAD_DIM, dtype=tl.float32))
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
-            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, None]
-        p = tl.math.exp2(qk)
+            ## qk_scale method folded into exp2 seems to be numerically imprecise. TODO(ahangupta): investigate why. ##
+            #m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            #qk = qk * qk_scale - m_ij[:, None]
+            qk = qk - m_ij[:, None]
+        p = tl.math.exp(qk)
         # -- compute correction factor
-        alpha = tl.math.exp2(m_i - m_ij)
+        #alpha = tl.math.exp2(m_i - m_ij)
+        alpha = tl.math.exp(m_i - m_ij)
         l_ij = tl.sum(p, 1)
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # prepare p and v for the dot
         v_ptr = offsetv_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-        v = tl.load(desc_v + v_ptr, mask=(tl.arange(0, BLOCK_N)*start_n*BLOCK_N)[:, None] < N_CTX, other=0.0)
+        v = tl.load(desc_v + v_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:, None] < N_CTX, other=0.0)
         p = p.to(dtype)
         # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
@@ -122,7 +129,7 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     qo_ptr = qo_offset_y + tl.arange(0, BLOCK_M)[:, None] * HEAD_DIM  + tl.arange(0, HEAD_DIM)[None, :]
-    q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None] * start_m * BLOCK_M < N_CTX, other=0.0)
+    q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None] + start_m * BLOCK_M < N_CTX, other=0.0)
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -491,10 +498,10 @@ if __name__ == '__main__':
 
     dtype = torch.float16
     mode="fwd"
-    BATCH=1
-    H=2
-    N_CTX=128
-    HEAD_DIM=32
+    BATCH=2
+    H=32
+    N_CTX=4096
+    HEAD_DIM=128
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -520,5 +527,5 @@ if __name__ == '__main__':
     true_output = fn()
 
     print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
-    print(f'sdpa output: {true_output}')
-    print(f'triton output: {triton_output}')
+    #print(f'sdpa output: {true_output}')
+    #print(f'triton output: {triton_output}')
