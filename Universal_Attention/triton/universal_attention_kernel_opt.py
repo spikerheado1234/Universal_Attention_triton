@@ -485,10 +485,10 @@ if __name__ == '__main__':
 
     dtype = torch.float16
     mode="fwd"
-    BATCH=32
-    H=32
-    N_CTX=256
-    HEAD_DIM=64
+    BATCH=1
+    H=2
+    N_CTX=128
+    HEAD_DIM=32
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -514,3 +514,5 @@ if __name__ == '__main__':
     true_output = fn()
 
     print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
+    print(f'sdpa output: {true_output}')
+    print(f'triton output: {triton_output}')
