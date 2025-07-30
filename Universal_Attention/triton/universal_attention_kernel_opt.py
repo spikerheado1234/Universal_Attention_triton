@@ -55,7 +55,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k_ptr = offsetk_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-        k = tl.trans(tl.load(desc_k + k_ptr, mask=tl.arange(0, BLOCK_N)[:, None]*start_n*BLOCK_N < N_CTX, other=0.0))
+        k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)*start_n*BLOCK_N)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
@@ -73,7 +73,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         acc = acc * alpha[:, None]
         # prepare p and v for the dot
         v_ptr = offsetv_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-        v = tl.load(desc_v + v_ptr, mask=tl.arange(0, BLOCK_N)[:, None]*start_n*BLOCK_N < N_CTX, other=0.0)
+        v = tl.load(desc_v + v_ptr, mask=(tl.arange(0, BLOCK_N)*start_n*BLOCK_N)[:, None] < N_CTX, other=0.0)
         p = p.to(dtype)
         # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
@@ -122,7 +122,7 @@ def _attn_fwd(sm_scale, M,  #
     qk_scale *= 1.44269504  # 1/log(2)
     # load q: it will stay in SRAM throughout
     qo_ptr = qo_offset_y + tl.arange(0, BLOCK_M)[:, None] * HEAD_DIM  + tl.arange(0, HEAD_DIM)[None, :]
-    q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < M, other=0.0)
+    q = tl.load(desc_q + qo_ptr, mask=tl.arange(0, BLOCK_M)[:, None] * start_m * BLOCK_M < N_CTX, other=0.0)
     # stage 1: off-band
     # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
     # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
@@ -144,7 +144,7 @@ def _attn_fwd(sm_scale, M,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    tl.store(desc_o+qo_ptr, acc.to(dtype), mask=tl.arange(0, BLOCK_M)+start_m*BLOCK_M < M)
+    tl.store(desc_o+qo_ptr, acc.to(dtype), mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < N_CTX)
 
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
@@ -504,7 +504,7 @@ if __name__ == '__main__':
 
     triton_output = fn()
 
-    fn = lambda: scaled_dot_product_attention(q,k,v, causal=causal)
+    fn = lambda: scaled_dot_product_attention(q,k,v, is_causal=causal)
 
     if mode == "bwd":
         o = fn()
