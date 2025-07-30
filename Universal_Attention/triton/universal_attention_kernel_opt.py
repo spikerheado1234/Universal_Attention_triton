@@ -85,10 +85,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offsetv_y += BLOCK_N * HEAD_DIM
     return acc, l_i, m_i
 
-@triton.autotune(
-        configs=get_cuda_configs(),
-        key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
-        )
+#@triton.autotune(
+#        configs=get_cuda_configs(),
+#        key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
+#        )
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -413,8 +413,12 @@ class _attention(torch.autograd.Function):
         desc_k = k
         desc_o = o
 
-        def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+        #def grid(META):
+        #    return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+
+        BLOCK_M=16
+        BLOCK_N=16
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
 
@@ -424,6 +428,8 @@ class _attention(torch.autograd.Function):
             desc_q, desc_k, desc_v, desc_o,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
+            BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
+            BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
