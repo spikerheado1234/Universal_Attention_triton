@@ -59,7 +59,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         k_ptr = offsetk_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
         k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
-        qk *=1/tl.sqrt(tl.cast(HEAD_DIM, dtype=tl.float32))
+        qk *= 1/tl.sqrt(tl.cast(HEAD_DIM, dtype=tl.float32))
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
@@ -199,7 +199,8 @@ def _attn_bwd_dkdv(dk, dv,  #
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
         qkT = tl.dot(k, qT)
-        pT = tl.math.exp2(qkT - m[None, :])
+        #pT = tl.math.exp2(qkT - m[None, :])
+        pT = tl.math.exp(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
             mask = (offs_m[None, :] >= offs_n[:, None])
@@ -251,7 +252,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
         qk = tl.dot(q, kT)
-        p = tl.math.exp2(qk - m)
+        #p = tl.math.exp2(qk - m)
+        p = tl.math.exp(qk - m)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
