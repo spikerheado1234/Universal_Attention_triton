@@ -2,6 +2,7 @@
 import torch
 from universal_attention_kernel_opt import attention
 from math import sqrt
+import pdb
 
 def sdpa_torch(q, k, v):
     """
@@ -10,7 +11,7 @@ def sdpa_torch(q, k, v):
     qk = torch.einsum('bnqh, bnkh -> bnqk', q, k)/torch.full((q.shape[0],q.shape[1],q.shape[2],k.shape[2]), sqrt(q.shape[-1])).to(q.device) ## S
     attn = torch.nn.functional.softmax(qk, dim=-1,dtype=torch.float32) ## P
     o = torch.einsum('bnqk, bnkh -> bnqh', attn.to(dtype=q.dtype), v) ## O
-    return o, attn
+    return o, attn.to(dtype=q.dtype)
 
 def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     ## Compute the gradient of v & attn ##
@@ -23,8 +24,8 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     dqk = (attn * dattn) - (torch.unsqueeze(d, dim=-1) * attn)  ## Check the correctness of this, may be incorrect.
 
     ## Finally, we compute dq and dk. ##
-    dq = torch.einsum('bnqk, bnkt -> bnqt', dqk, k) / torch.full(q.shape, sqrt(q.shape[-1])).to(q.device)
-    dk = torch.einsum('bnkq, bnkt -> bnqt', dqk, q) / torch.full(k.shape, sqrt(q.shape[-1])).to(q.device)
+    dq = torch.einsum('bnqk, bnkt -> bnqt', dqk, k) / torch.full(q.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
+    dk = torch.einsum('bnkq, bnkt -> bnqt', dqk, q) / torch.full(k.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
 
     return dq, dk, dv 
 
