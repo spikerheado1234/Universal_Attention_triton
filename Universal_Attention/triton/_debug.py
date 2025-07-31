@@ -48,10 +48,10 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False):
         fn()
         sdpa_output.backward(do, retain_graph=True)
 
-    print(f'sdpa_output: {sdpa_output}')
-    print(f'triton_output: {triton_output}')
     print(f'outputs allclose: {torch.allclose(sdpa_output, triton_output, atol=1e-1, rtol=1e-1)}')
     if backward:
+        print(f'q_torch.grad: {q_torch.grad}')
+        print(f'q.grad: {q.grad}')
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1e-1, rtol=1e-1)}')

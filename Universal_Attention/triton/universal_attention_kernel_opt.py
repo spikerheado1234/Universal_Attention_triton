@@ -147,7 +147,7 @@ def _attn_fwd(sm_scale, M,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX)
     # epilogue
-    m_i += tl.math.log2(l_i)
+    m_i += tl.math.log(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
