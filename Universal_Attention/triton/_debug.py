@@ -31,16 +31,17 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False):
     print(f'sdpa_output: {sdpa_output}')
     print(f'triton_output: {triton_output}')
     print(f'outputs allclose: {torch.allclose(sdpa_output, triton_output, atol=1e-1, rtol=1e-1)}')
-    print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
-    print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1e-1, rtol=1e-1)}')
-    print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1e-1, rtol=1e-1)}')
+    if backward:
+        print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1e-1, rtol=1e-1)}')
 
 if __name__ == '__main__':
     ## Here we call whatever we would like to debug. We instantiate with debug sized tensors. ##
     torch.manual_seed(0)
     BATCH=1
     H=1
-    N_CTX=32
+    N_CTX=128
     HEAD_DIM=16
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
@@ -48,5 +49,5 @@ if __name__ == '__main__':
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    _debug_triton_fused_mhsa(q,k,v, backward=False)
+    _debug_triton_fused_mhsa(q,k,v, backward=True)
 
