@@ -398,7 +398,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                       )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq *= LN2
+    dq *= sm_scale
     tl.store(dq_ptrs, dq)
 
 class _attention(torch.autograd.Function):
@@ -464,8 +464,6 @@ class _attention(torch.autograd.Function):
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
         BLK_SLICE_FACTOR = 2
         RCP_LN2 = 1.4426950408889634  # = 1.0 / ln(2)
-        arg_k = k
-        arg_k = arg_k * (ctx.sm_scale * RCP_LN2)
         PRE_BLOCK = 128
         assert N_CTX % PRE_BLOCK == 0
         pre_grid = (N_CTX // PRE_BLOCK, BATCH * N_HEAD)
@@ -477,8 +475,10 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
         grid = (N_CTX // BLOCK_N1, 1, BATCH * N_HEAD)
+        scale = 1.0 / ctx.HEAD_DIM**0.5
+        arg_k = k
         _attn_bwd[grid](
-            q, arg_k, v, ctx.sm_scale, do, dq, dk, dv,  #
+            q, arg_k, v, scale, do, dq, dk, dv,  #
             M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             N_HEAD, N_CTX,  #
