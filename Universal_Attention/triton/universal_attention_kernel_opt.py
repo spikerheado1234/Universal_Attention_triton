@@ -416,7 +416,7 @@ class _attention(torch.autograd.Function):
         extra_kern_args = {}
         # Tuning for AMD target
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32) ## (batch, head, sequence).
         desc_q = q
         desc_v = v
         desc_k = k
