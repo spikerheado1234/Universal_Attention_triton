@@ -202,9 +202,10 @@ def _attn_bwd_dkdv(dk, dv,  #
         qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
         #pT = tl.math.exp2(qkT - m[None, :])
         pT = tl.math.exp(qkT - m[None, :])
+        pdb.set_trace()
         # Autoregressive masking.
         if MASK:
-            mask = (offs_m[None, :] <= offs_n[:, None])
+            mask = (offs_m[None, :] <= offs_n[:, None]) & (offs_m[None, :] < N_CTX) & (offs_n[:, None] < N_CTX)
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
