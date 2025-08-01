@@ -182,29 +182,27 @@ def _attn_bwd_dkdv(dk, dv,  #
                    BLOCK_N1: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
                    # Filled in by the wrapper.
-                   start_n, start_m, num_steps,  #
-                   MASK: tl.constexpr):
+                   start_n, start_m, num_steps):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
-    qT_ptrs = Q + offs_m[None, :] * stride_tok + offs_k[:, None] * stride_d
+    qT_ptrs = Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     do_ptrs = DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     # BLOCK_N1 must be a multiple of BLOCK_M1, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_N1 % BLOCK_M1 == 0)
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
-        qT = tl.load(qT_ptrs, mask=offs_m[None, :] < N_CTX)
+        qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX))
         # Load m before computing qk to reduce pipeline stall.
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m, mask=offs_m < N_CTX)
-        qkT = tl.dot(k, qT)
+        qkT = tl.dot(k, qT) / tl.sqrt(HEAD_DIM)
         #pT = tl.math.exp2(qkT - m[None, :])
         pT = tl.math.exp(qkT - m[None, :])
         # Autoregressive masking.
-        if MASK:
-            mask = (offs_m[None, :] >= offs_n[:, None])
-            pT = tl.where(mask, pT, 0.0)
+        mask = (offs_m[None, :] <= offs_n[:, None])
+        pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
         ppT = pT
@@ -320,7 +318,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     k = tl.load(K + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
     v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
 
-    num_steps = BLOCK_N1 // MASK_BLOCK_M1
+    num_steps = tl.cdiv(N_CTX, BLOCK_M1)
 
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
                             Q, k, v, sm_scale,  #
@@ -330,24 +328,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                             H, N_CTX,  #
                             MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
                             start_n, start_m, num_steps,  #
-                            MASK=True  #
                             )
-
-    start_m += num_steps * MASK_BLOCK_M1
-    num_steps = (N_CTX - start_m) // BLOCK_M1
-
-    # Compute dK and dV for non-masked blocks.
-    dk, dv = _attn_bwd_dkdv(  #
-        dk, dv,  #
-        Q, k, v, sm_scale,  #
-        DO,  #
-        M, D,  #
-        stride_tok, stride_d,  #
-        H, N_CTX,  #
-        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-        start_n, start_m, num_steps,  #
-        MASK=False  #
-    )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX)
@@ -475,6 +456,7 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
+        print(f'triton d: {delta.sum()}')
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         arg_k = k
@@ -511,7 +493,7 @@ if __name__ == '__main__':
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     sm_scale = 1.3
-    causal=False
+    causal = True
     fn = lambda: attention(q, k, v, causal, sm_scale)
     if mode == "bwd":
         o = fn()
