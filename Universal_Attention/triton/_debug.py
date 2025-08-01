@@ -67,7 +67,7 @@ if __name__ == '__main__':
     torch.manual_seed(0)
     BATCH=1
     H=1
-    N_CTX=128
+    N_CTX=16
     HEAD_DIM=16
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
