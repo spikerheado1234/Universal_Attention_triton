@@ -195,9 +195,9 @@ def _attn_bwd_dkdv(dk, dv,  #
     curr_m = start_m
     step_m = BLOCK_M1
     for blk_idx in range(num_steps):
+        offs_m = curr_m + tl.arange(0, BLOCK_M1)
         qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX))
         # Load m before computing qk to reduce pipeline stall.
-        offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m, mask=offs_m < N_CTX)
         qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
         #pT = tl.math.exp2(qkT - m[None, :])
@@ -250,15 +250,16 @@ def _attn_bwd_dq(dq, q, K, V,  #
     curr_n = start_n
     step_n = BLOCK_N2
     for blk_idx in range(num_steps):
+        offs_n = curr_n + tl.arange(0, BLOCK_N2)
         kT = tl.load(kT_ptrs, mask=offs_n[None, :] < N_CTX)
         vT = tl.load(vT_ptrs, mask=offs_n[None, :] < N_CTX)
-        qk = tl.dot(q, kT)
+        qk = tl.dot(q, kT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
         #p = tl.math.exp2(qk - m)
         p = tl.math.exp(qk - m)
         # Autoregressive masking.
         if MASK:
             offs_n = curr_n + tl.arange(0, BLOCK_N2)
-            mask = (offs_m[:, None] >= offs_n[None, :])
+            mask = (offs_m[:, None] >= offs_n[None, :]) & (offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX)
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
