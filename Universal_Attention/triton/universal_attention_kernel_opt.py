@@ -351,12 +351,12 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX)
+    tl.store(dv_ptrs, dv.to(tl.float16), mask=offs_n[:, None] < N_CTX)
 
     # Write back dK.
     dk *= sm_scale
     dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-    tl.store(dk_ptrs, dk, mask=offs_n[:, None] < N_CTX)
+    tl.store(dk_ptrs, dk.to(tl.float16), mask=offs_n[:, None] < N_CTX)
 
     # ----- BEGIN dQ REPLACEMENT -----
     # THIS BLOCK DOES DQ:

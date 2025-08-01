@@ -74,7 +74,7 @@ if __name__ == '__main__':
     torch.manual_seed(0)
     BATCH=2
     H=32
-    N_CTX=64
+    N_CTX=33
     HEAD_DIM=128
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
