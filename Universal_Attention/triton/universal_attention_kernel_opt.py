@@ -478,7 +478,6 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
-        print(f'triton d: {delta.sum()}')
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         arg_k = k
@@ -507,9 +506,9 @@ if __name__ == '__main__':
     dtype = torch.float16
     mode="bwd"
     BATCH=2
-    H=32
-    N_CTX=512
-    HEAD_DIM=128
+    H=2
+    N_CTX=32
+    HEAD_DIM=32
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)

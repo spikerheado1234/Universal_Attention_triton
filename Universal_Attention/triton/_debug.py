@@ -61,8 +61,8 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
         #print(f'q_torch.grad: {q_torch.grad}')
         #print(f'q.grad: {q.grad}')
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
-        print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
+        print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1e-1, rtol=1e-1)}')
         print(f'------output sanity checking------')
         print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
@@ -72,9 +72,9 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
 if __name__ == '__main__':
     ## Here we call whatever we would like to debug. We instantiate with debug sized tensors. ##
     torch.manual_seed(0)
-    BATCH=1
-    H=1
-    N_CTX=512
+    BATCH=2
+    H=32
+    N_CTX=64
     HEAD_DIM=128
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
