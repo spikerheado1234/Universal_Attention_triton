@@ -406,6 +406,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
+        assert causal, 'currently, only support causal-autoregressive style generation only.'
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -514,6 +515,9 @@ if __name__ == '__main__':
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    q_torch = q.clone().detach().requires_grad(True)
+    k_torch = k.clone().detach().requires_grad(True)
+    v_torch = v.clone().detach().requires_grad(True)
     sm_scale = 1.3
     causal = True
     fn = lambda: attention(q, k, v, causal, sm_scale)
@@ -534,5 +538,9 @@ if __name__ == '__main__':
     true_output = fn()
 
     print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
+    if mode == "bwd":
+        print(f'dq delta is: {torch.allclose(q_torch.grad, q.grad, rtol=1, atol=1)}')
+        print(f'dk delta is: {torch.allclose(k_torch.grad, k.grad, rtol=1, atol=1)}')
+        print(f'dv delta is: {torch.allclose(v_torch.grad, v.grad, rtol=1, atol=1)}')
     #print(f'sdpa output: {true_output}')
     #print(f'triton output: {triton_output}')
