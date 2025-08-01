@@ -345,7 +345,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         H, N_CTX,  #
         BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
         start_n, start_m, num_steps,  #
-        MASK=False  #
+        MASK=True  #
     )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
