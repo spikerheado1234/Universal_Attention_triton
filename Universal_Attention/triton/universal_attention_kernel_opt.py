@@ -358,46 +358,64 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dk_ptrs, dk, mask=offs_n[:, None] < N_CTX)
 
+    # ----- BEGIN dQ REPLACEMENT -----
     # THIS BLOCK DOES DQ:
     start_m = pid * BLOCK_M2
-    end_n = start_m + BLOCK_M2
-
-    MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
     offs_m = start_m + tl.arange(0, BLOCK_M2)
 
+    # Load data for this query block
     q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_m[:, None] < N_CTX)
     dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
     do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_m[:, None] < N_CTX)
+    m = tl.load(M + offs_m, mask=offs_m < N_CTX)[:, None]
+    D_loaded = tl.load(D + offs_m, mask=offs_m < N_CTX)
 
-    m = tl.load(M + offs_m, mask=offs_m < N_CTX)
-    m = m[:, None]
+    # For causal attention, the q-block iterates backward over keys from the diagonal.
+    # The highest key index this query block can see is limited by N_CTX.
+    effective_end_n = tl.minimum(start_m + BLOCK_M2, N_CTX)
+    
+    if causal:
+        # We start from key 0 and go up to the diagonal.
+        num_steps = tl.cdiv(effective_end_n, BLOCK_N2)
+        dq = _attn_bwd_dq(
+            dq, q, K, V, do, m, D_loaded,
+            stride_tok, stride_d, H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
+            start_m, 0, num_steps, MASK=True
+        )
+    else: # Non-causal
+        num_steps = tl.cdiv(N_CTX, BLOCK_N2)
+        dq = _attn_bwd_dq(
+            dq, q, K, V, do, m, D_loaded,
+            stride_tok, stride_d, H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
+            start_m, 0, num_steps, MASK=False
+        )
 
-    # Compute dQ for masked (diagonal) blocks.
-    # NOTE: This code scans each row of QK^T backward (from right to left,
-    # but inside each call to _attn_bwd_dq, from left to right), but that's
-    # not due to anything important.  I just wanted to reuse the loop
-    # structure for dK & dV above as much as possible.
-    end_n = tl.minimum(start_m + BLOCK_M2, N_CTX)
-    num_steps = tl.cdiv(end_n, BLOCK_N2)
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                      start_m, 0, num_steps,  #
-                      MASK=True  #
-                      )
-    # stage 2
-    num_steps = tl.cdiv(N_CTX, BLOCK_N2)
-    dq = _attn_bwd_dq(dq, q, K, V,  #
-                      do, m, D,  #
-                      stride_tok, stride_d,  #
-                      H, N_CTX,  #
-                      BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                      start_m, 0, num_steps,  #
-                      MASK=False  #
-                      )
-    ## This is the old code, we keep in case we would like to revert to it. ##
+    # Write back dQ.
+    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    dq *= sm_scale
+    tl.store(dq_ptrs, dq, mask=offs_m[:, None] < N_CTX)
+    # ----- END dQ REPLACEMENT -----
+
+    ## THis is the old code-path. ##
+    #start_m = pid * BLOCK_M2
+    #end_n = start_m + BLOCK_M2
+
+    #MASK_BLOCK_N2: tl.constexpr = BLOCK_N2 // BLK_SLICE_FACTOR
+    #offs_m = start_m + tl.arange(0, BLOCK_M2)
+
+    #q = tl.load(Q + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_m[:, None] < N_CTX)
+    #dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
+    #do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_m[:, None] < N_CTX)
+
+    #m = tl.load(M + offs_m, mask=offs_m < N_CTX)
+    #m = m[:, None]
+
+    ## Compute dQ for masked (diagonal) blocks.
+    ## NOTE: This code scans each row of QK^T backward (from right to left,
+    ## but inside each call to _attn_bwd_dq, from left to right), but that's
+    ## not due to anything important.  I just wanted to reuse the loop
+    ## structure for dK & dV above as much as possible.
+    ### This is the old code, we keep in case we would like to revert to it. ##
     #num_steps = BLOCK_M2 // MASK_BLOCK_N2
     #dq = _attn_bwd_dq(dq, q, K, V,  #
     #                  do, m, D,  #
@@ -418,10 +436,10 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     #                  start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
     #                  MASK=False  #
     #                  )
-    # Write back dQ.
-    dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq *= sm_scale
-    tl.store(dq_ptrs, dq, mask=offs_m[:, None] < N_CTX)
+    ## Write back dQ.
+    #dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
+    #dq *= sm_scale
+    #tl.store(dq_ptrs, dq, mask=offs_m[:, None] < N_CTX)
 
 class _attention(torch.autograd.Function):
 
