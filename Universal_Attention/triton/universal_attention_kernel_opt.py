@@ -209,8 +209,8 @@ def _attn_bwd_dkdv(dk, dv,  #
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
         ppT = pT
-        ppT = ppT.to(tl.float16)
-        dv += tl.dot(ppT, do)
+        #ppT = ppT.to(tl.float16)
+        dv += tl.dot(ppT, tl.cast(do, tl.float32))
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m, mask=offs_m < N_CTX)
         # Compute dP and dS.
@@ -377,26 +377,47 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     # but inside each call to _attn_bwd_dq, from left to right), but that's
     # not due to anything important.  I just wanted to reuse the loop
     # structure for dK & dV above as much as possible.
-    num_steps = BLOCK_M2 // MASK_BLOCK_N2
+    end_n = tl.minimum(start_m + BLOCK_M2, N_CTX)
+    num_steps = tl.cdiv(end_n, BLOCK_N2)
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, D,  #
                       stride_tok, stride_d,  #
                       H, N_CTX,  #
                       BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
-                      start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+                      start_m, 0, num_steps,  #
                       MASK=True  #
                       )
-    end_n -= num_steps * MASK_BLOCK_N2
     # stage 2
-    num_steps = end_n // BLOCK_N2
+    num_steps = tl.cdiv(N_CTX, BLOCK_N2)
     dq = _attn_bwd_dq(dq, q, K, V,  #
                       do, m, D,  #
                       stride_tok, stride_d,  #
                       H, N_CTX,  #
                       BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
-                      start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
+                      start_m, 0, num_steps,  #
                       MASK=False  #
                       )
+    ## This is the old code, we keep in case we would like to revert to it. ##
+    #num_steps = BLOCK_M2 // MASK_BLOCK_N2
+    #dq = _attn_bwd_dq(dq, q, K, V,  #
+    #                  do, m, D,  #
+    #                  stride_tok, stride_d,  #
+    #                  H, N_CTX,  #
+    #                  BLOCK_M2, MASK_BLOCK_N2, HEAD_DIM,  #
+    #                  start_m, end_n - num_steps * MASK_BLOCK_N2, num_steps,  #
+    #                  MASK=True  #
+    #                  )
+    #end_n -= num_steps * MASK_BLOCK_N2
+    ## stage 2
+    #num_steps = end_n // BLOCK_N2
+    #dq = _attn_bwd_dq(dq, q, K, V,  #
+    #                  do, m, D,  #
+    #                  stride_tok, stride_d,  #
+    #                  H, N_CTX,  #
+    #                  BLOCK_M2, BLOCK_N2, HEAD_DIM,  #
+    #                  start_m, end_n - num_steps * BLOCK_N2, num_steps,  #
+    #                  MASK=False  #
+    #                  )
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= sm_scale
@@ -507,7 +528,7 @@ if __name__ == '__main__':
     mode="bwd"
     BATCH=2
     H=2
-    N_CTX=32
+    N_CTX=16
     HEAD_DIM=32
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
