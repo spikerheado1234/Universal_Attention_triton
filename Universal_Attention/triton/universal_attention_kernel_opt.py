@@ -27,13 +27,6 @@ def get_cuda_configs():
 
     return configs
 
-#@triton.jit
-#def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-#    if isinstance(desc_or_ptr, tl.tensor_descriptor):
-#        return desc_or_ptr
-#    else:
-#        return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
-
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
@@ -66,15 +59,11 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
-            ## qk_scale method folded into exp2 seems to be numerically imprecise. TODO(ahangupta): investigate why. ##
-            #m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            #qk = qk * qk_scale - m_ij[:, None]
             qk = qk - m_ij[:, None]
 
         p = tl.math.exp(qk)
         # -- compute correction factor
-        #alpha = tl.math.exp2(m_i - m_ij)
         alpha = tl.math.exp(m_i - m_ij)
         l_ij = tl.sum(p, 1)
         # -- update output accumulator --
@@ -114,8 +103,6 @@ def _attn_fwd(sm_scale, M,  #
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
-
-    y_dim = Z * H * N_CTX
 
     offset_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
     qo_offset_y = offset_y + start_m * BLOCK_M * HEAD_DIM
@@ -252,7 +239,6 @@ def _attn_bwd_dq(dq, q, K, V,  #
         kT = tl.load(kT_ptrs, mask=offs_n[None, :] < N_CTX)
         vT = tl.load(vT_ptrs, mask=offs_n[None, :] < N_CTX)
         qk = tl.dot(q, kT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
-        #p = tl.math.exp2(qk - m)
         p = tl.math.exp(qk - m)
         # Autoregressive masking.
         if MASK:
@@ -287,7 +273,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               BLK_SLICE_FACTOR: tl.constexpr,  #
               HEAD_DIM: tl.constexpr,
               causal: tl.constexpr):
-    LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
@@ -311,7 +296,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     start_n = pid * BLOCK_N1
     start_m = start_n
 
-    MASK_BLOCK_M1: tl.constexpr = BLOCK_M1 // BLK_SLICE_FACTOR
     offs_n = start_n + tl.arange(0, BLOCK_N1)
 
     dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
@@ -396,6 +380,7 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
         assert causal, 'currently, only support causal-autoregressive style generation only.'
+        assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths.'
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
