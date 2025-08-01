@@ -4,12 +4,13 @@ from universal_attention_kernel_opt import attention
 from math import sqrt
 import pdb
 
-def sdpa_torch(q, k, v):
+def sdpa_torch(q, k, v, causal=False):
     """
     Einsum variant of sdpa, to track intermediate tensor values.
     """
     qk = torch.einsum('bnqh, bnkh -> bnqk', q, k)/torch.full((q.shape[0],q.shape[1],q.shape[2],k.shape[2]), sqrt(q.shape[-1])).to(q.device) ## S
-    print(f'qk: {qk.sum()}')
+    if causal:
+        qk += torch.triu(torch.full(qk.shape, -1e-9))
     attn = torch.nn.functional.softmax(qk, dim=-1,dtype=torch.float32) ## P
     o = torch.einsum('bnqk, bnkh -> bnqh', attn.to(dtype=q.dtype), v) ## O
     return o, attn.to(dtype=q.dtype)
@@ -37,22 +38,21 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
 
     return dq, dk, dv 
 
-def _debug_triton_fused_mhsa(q,k,v, backward=False):
+def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
     q_torch = q.clone().detach().requires_grad_(True)
     k_torch = k.clone().detach().requires_grad_(True)
     v_torch = v.clone().detach().requires_grad_(True)
-    sdpa_output, attn = sdpa_torch(q_torch, k_torch, v_torch)
+    sdpa_output, attn = sdpa_torch(q_torch, k_torch, v_torch, causal)
     q_sanity = q.clone().detach().requires_grad_(True)
     k_sanity = k.clone().detach().requires_grad_(True)
     v_sanity = v.clone().detach().requires_grad_(True)
     sm_scale = 1.3
-    causal = True
     fn = lambda: attention(q, k, v, causal, sm_scale)
     do = torch.randn_like(q).to(q.device)
     triton_output = fn()
     if backward:
-        dq_sanity, dk_sanity, dv_sanity = sdpa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do)
+        dq_sanity, dk_sanity, dv_sanity = sdpa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do, causal)
         fn = lambda: triton_output.backward(do, retain_graph=True)
         fn()
         sdpa_output.backward(do, retain_graph=True)
