@@ -205,7 +205,7 @@ def _attn_bwd_dkdv(dk, dv,  #
         pdb.set_trace()
         # Autoregressive masking.
         if MASK:
-            mask = (offs_m[None, :] <= offs_n[:, None]) & (offs_m[None, :] < N_CTX) & (offs_n[:, None] < N_CTX)
+            mask = (offs_m[None, :] >= offs_n[:, None]) & (offs_m[None, :] < N_CTX) & (offs_n[:, None] < N_CTX)
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
@@ -332,11 +332,12 @@ def _attn_bwd(Q, K, V, sm_scale,  #
                         stride_tok, stride_d,  #
                         H, N_CTX,  #
                         MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                        start_n, start_m, num_steps,  #
+                        start_n, start_m, num_steps=1,  #
                         MASK=True  #
                         )
 
-    start_m += num_steps * MASK_BLOCK_M1
+    #start_m += num_steps * MASK_BLOCK_M1
+    start_m = start_n + BLOCK_M1
     num_steps = tl.cdiv((N_CTX - start_m), BLOCK_M1)
 
     # Compute dK and dV for non-masked blocks.
