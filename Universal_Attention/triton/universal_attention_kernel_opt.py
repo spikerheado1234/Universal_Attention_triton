@@ -350,17 +350,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         MASK=False  #
     )
 
-    #dk, dv = _attn_bwd_dkdv(dk, dv,  #
-    #                        Q, k, v, sm_scale,  #
-    #                        DO,  #
-    #                        M, D,  #
-    #                        stride_tok, stride_d,  #
-    #                        H, N_CTX,  #
-    #                        MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-    #                        start_n, start_m, num_steps,  #
-    #                        causal
-    #                        )
-
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX)
 
