@@ -200,7 +200,6 @@ def _attn_bwd_dkdv(dk, dv,  #
         # Load m before computing qk to reduce pipeline stall.
         m = tl.load(M + offs_m, mask=offs_m < N_CTX)
         qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
-        #pT = tl.math.exp2(qkT - m[None, :])
         pT = tl.math.exp(qkT - m[None, :])
         # Autoregressive masking.
         if MASK:
@@ -209,15 +208,14 @@ def _attn_bwd_dkdv(dk, dv,  #
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
         ppT = pT
-        #ppT = ppT.to(tl.float16)
         dv += tl.dot(ppT, tl.cast(do, tl.float32))
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m, mask=offs_m < N_CTX)
         # Compute dP and dS.
         dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
         dsT = pT * (dpT - Di[None, :])
-        dsT = dsT.to(tl.float16)
-        dk += tl.dot(dsT, tl.trans(qT))
+        #dsT = dsT.to(tl.float16)
+        dk += tl.dot(dsT, tl.cast(tl.trans(qT), tl.float32))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_tok
