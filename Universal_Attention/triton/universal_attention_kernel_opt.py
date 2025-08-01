@@ -244,7 +244,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     # D (= delta) is pre-divided by ds_scale.
-    Di = tl.load(D + offs_m)
+    Di = tl.load(D + offs_m, mask=offs_m < N_CTX, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
     tl.static_assert(BLOCK_M2 % BLOCK_N2 == 0)
     curr_n = start_n
@@ -368,7 +368,6 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
     do = tl.load(DO + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_m[:, None] < N_CTX)
     m = tl.load(M + offs_m, mask=offs_m < N_CTX)[:, None]
-    D_loaded = tl.load(D + offs_m, mask=offs_m < N_CTX)
 
     # For causal attention, the q-block iterates backward over keys from the diagonal.
     # The highest key index this query block can see is limited by N_CTX.
@@ -378,14 +377,14 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         # We start from key 0 and go up to the diagonal.
         num_steps = tl.cdiv(effective_end_n, BLOCK_N2)
         dq = _attn_bwd_dq(
-            dq, q, K, V, do, m, D_loaded,
+            dq, q, K, V, do, m, D,
             stride_tok, stride_d, H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
             start_m, 0, num_steps, MASK=True
         )
     else: # Non-causal
         num_steps = tl.cdiv(N_CTX, BLOCK_N2)
         dq = _attn_bwd_dq(
-            dq, q, K, V, do, m, D_loaded,
+            dq, q, K, V, do, m, D,
             stride_tok, stride_d, H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
             start_m, 0, num_steps, MASK=False
         )
