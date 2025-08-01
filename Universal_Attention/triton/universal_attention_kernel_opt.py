@@ -184,7 +184,7 @@ def _attn_bwd_dkdv(dk, dv,  #
                    BLOCK_N1: tl.constexpr,  #
                    HEAD_DIM: tl.constexpr,  #
                    # Filled in by the wrapper.
-                   start_n, start_m, num_steps):
+                   start_n, start_m, num_steps, MASK):
     offs_m = start_m + tl.arange(0, BLOCK_M1)
     offs_n = start_n + tl.arange(0, BLOCK_N1)
     offs_k = tl.arange(0, HEAD_DIM)
@@ -203,8 +203,9 @@ def _attn_bwd_dkdv(dk, dv,  #
         #pT = tl.math.exp2(qkT - m[None, :])
         pT = tl.math.exp(qkT - m[None, :])
         # Autoregressive masking.
-        mask = (offs_m[None, :] <= offs_n[:, None])
-        pT = tl.where(mask, pT, 0.0)
+        if MASK:
+            mask = (offs_m[None, :] <= offs_n[:, None])
+            pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX)
         # Compute dV.
         ppT = pT
@@ -285,7 +286,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
               BLOCK_M2: tl.constexpr,  #
               BLOCK_N2: tl.constexpr,  #
               BLK_SLICE_FACTOR: tl.constexpr,  #
-              HEAD_DIM: tl.constexpr):
+              HEAD_DIM: tl.constexpr,
+              causal: tl.constexpr):
     LN2: tl.constexpr = 0.6931471824645996  # = ln(2)
 
     bhid = tl.program_id(2)
@@ -323,14 +325,42 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     num_steps = tl.cdiv(N_CTX, BLOCK_M1)
 
     dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q, k, v, sm_scale,  #
-                            DO,  #
-                            M, D,  #
-                            stride_tok, stride_d,  #
-                            H, N_CTX,  #
-                            MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
-                            start_n, start_m, num_steps,  #
-                            )
+                        Q, k, v, sm_scale,  #
+                        DO,  #
+                        M, D,  #
+                        stride_tok, stride_d,  #
+                        H, N_CTX,  #
+                        MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+                        start_n, start_m, num_steps,  #
+                        MASK=True  #
+                        )
+
+    start_m += num_steps * MASK_BLOCK_M1
+    num_steps = tl.cdiv((N_CTX - start_m), BLOCK_M1)
+
+    # Compute dK and dV for non-masked blocks.
+    dk, dv = _attn_bwd_dkdv(  #
+        dk, dv,  #
+        Q, k, v, sm_scale,  #
+        DO,  #
+        M, D,  #
+        stride_tok, stride_d,  #
+        H, N_CTX,  #
+        BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+        start_n, start_m, num_steps,  #
+        MASK=False  #
+    )
+
+    #dk, dv = _attn_bwd_dkdv(dk, dv,  #
+    #                        Q, k, v, sm_scale,  #
+    #                        DO,  #
+    #                        M, D,  #
+    #                        stride_tok, stride_d,  #
+    #                        H, N_CTX,  #
+    #                        MASK_BLOCK_M1, BLOCK_N1, HEAD_DIM,  #
+    #                        start_n, start_m, num_steps,  #
+    #                        causal
+    #                        )
 
     dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
     tl.store(dv_ptrs, dv, mask=offs_n[:, None] < N_CTX)
@@ -472,6 +502,7 @@ class _attention(torch.autograd.Function):
             BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=ctx.HEAD_DIM,  #
+            causal=ctx.causal,
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
         )
