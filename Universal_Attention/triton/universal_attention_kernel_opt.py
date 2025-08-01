@@ -505,19 +505,19 @@ attention = _attention.apply
 if __name__ == '__main__':
 
     dtype = torch.float16
-    mode="fwd"
+    mode="bwd"
     BATCH=2
     H=32
-    N_CTX=16
+    N_CTX=512
     HEAD_DIM=128
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    q_torch = q.clone().detach().requires_grad(True)
-    k_torch = k.clone().detach().requires_grad(True)
-    v_torch = v.clone().detach().requires_grad(True)
+    q_torch = q.clone().detach().requires_grad_(True)
+    k_torch = k.clone().detach().requires_grad_(True)
+    v_torch = v.clone().detach().requires_grad_(True)
     sm_scale = 1.3
     causal = True
     fn = lambda: attention(q, k, v, causal, sm_scale)
@@ -528,7 +528,7 @@ if __name__ == '__main__':
 
     triton_output = fn()
 
-    fn = lambda: scaled_dot_product_attention(q,k,v, is_causal=causal)
+    fn = lambda: scaled_dot_product_attention(q_torch,k_torch,v_torch, is_causal=causal)
 
     if mode == "bwd":
         o = fn()
@@ -537,10 +537,12 @@ if __name__ == '__main__':
 
     true_output = fn()
 
-    print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
+    if mode != "bwd":
+        print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
+
     if mode == "bwd":
+        print(f'q_torch.grad: {q_torch.grad}')
+        print(f'q.grad: {q.grad}')
         print(f'dq delta is: {torch.allclose(q_torch.grad, q.grad, rtol=1, atol=1)}')
         print(f'dk delta is: {torch.allclose(k_torch.grad, k.grad, rtol=1, atol=1)}')
         print(f'dv delta is: {torch.allclose(v_torch.grad, v.grad, rtol=1, atol=1)}')
-    #print(f'sdpa output: {true_output}')
-    #print(f'triton output: {triton_output}')
