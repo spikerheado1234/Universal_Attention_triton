@@ -10,7 +10,7 @@ def sdpa_torch(q, k, v, causal=False):
     """
     qk = torch.einsum('bnqh, bnkh -> bnqk', q, k)/torch.full((q.shape[0],q.shape[1],q.shape[2],k.shape[2]), sqrt(q.shape[-1])).to(q.device) ## S
     if causal:
-        qk += torch.triu(torch.full(qk.shape, -1e-9))
+        qk += torch.triu(torch.full(qk.shape, -1e6), diagonal=1).to(q.device)
     attn = torch.nn.functional.softmax(qk, dim=-1,dtype=torch.float32) ## P
     o = torch.einsum('bnqk, bnkh -> bnqh', attn.to(dtype=q.dtype), v) ## O
     return o, attn.to(dtype=q.dtype)
@@ -30,7 +30,6 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     dqk = (attn * dattn) - (torch.unsqueeze(d, dim=-1) * attn)  ## Check the correctness of this, may be incorrect.
     print(f'dqk: {dqk.sum()}')
     print(f'attn: {attn.sum()}')
-    print(f'attn: {attn}')
 
     ## Finally, we compute dq and dk. ##
     dq = torch.einsum('bnqk, bnkt -> bnqt', dqk, k) / torch.full(q.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
@@ -52,7 +51,7 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
     do = torch.randn_like(q).to(q.device)
     triton_output = fn()
     if backward:
-        dq_sanity, dk_sanity, dv_sanity = sdpa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do, causal)
+        dq_sanity, dk_sanity, dv_sanity = sdpa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do)
         fn = lambda: triton_output.backward(do, retain_graph=True)
         fn()
         sdpa_output.backward(do, retain_graph=True)
@@ -75,13 +74,14 @@ if __name__ == '__main__':
     torch.manual_seed(0)
     BATCH=1
     H=1
-    N_CTX=128
+    N_CTX=32
     HEAD_DIM=16
+    causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
     dtype=torch.float16
     q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    _debug_triton_fused_mhsa(q,k,v, backward=True)
+    _debug_triton_fused_mhsa(q,k,v, backward=True, causal=causal)
 

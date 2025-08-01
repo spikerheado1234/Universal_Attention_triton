@@ -40,7 +40,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr):
+                    N_CTX: tl.constexpr, causal: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -50,8 +50,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
     # causal = False
     else:
         lo, hi = 0, N_CTX
-    offsetk_y = offset_y + lo
-    offsetv_y = offset_y + lo
+    offsetk_y = offset_y + lo * HEAD_DIM
+    offsetv_y = offset_y + lo * HEAD_DIM
     # loop over k, v and update accumulator
     for start_n in tl.range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -71,6 +71,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             #qk = qk * qk_scale - m_ij[:, None]
             qk = qk - m_ij[:, None]
+
         p = tl.math.exp(qk)
         # -- compute correction factor
         #alpha = tl.math.exp2(m_i - m_ij)
@@ -105,6 +106,7 @@ def _attn_fwd(sm_scale, M,  #
               FP8_OUTPUT: tl.constexpr,  #
               STAGE: tl.constexpr,  #
               warp_specialize: tl.constexpr,  #
+              causal: tl.constexpr,
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
@@ -138,14 +140,14 @@ def _attn_fwd(sm_scale, M,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX)
+                                        4 - STAGE, offs_m, offs_n, N_CTX, causal)
     # stage 2: on-band
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX)
+                                        2, offs_m, offs_n, N_CTX, causal)
     # epilogue
     m_i += tl.math.log(l_i)
     acc = acc / l_i[:, None]
@@ -423,6 +425,7 @@ class _attention(torch.autograd.Function):
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
+            causal=causal,
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
@@ -485,7 +488,7 @@ if __name__ == '__main__':
     mode="fwd"
     BATCH=2
     H=32
-    N_CTX=4096
+    N_CTX=16
     HEAD_DIM=128
     device="cuda" if torch.cuda.is_available() else "cpu"
     provider = "triton" ## triton/flash.
