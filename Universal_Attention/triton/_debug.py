@@ -119,22 +119,20 @@ def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     k_sanity = k.clone().detach().requires_grad_(True)
     v_sanity = v.clone().detach().requires_grad_(True)
     sm_scale = 1.3
-    #fn = lambda: attention(q, k, v, causal, sm_scale)
+    fn = lambda: attention(q, k, v, causal, sm_scale)
     do = torch.randn_like(q).to(q.device)
-    #triton_output = fn()
+    triton_output = fn()
     if backward:
         dq_sanity, dk_sanity, dv_sanity = sdpa_gqa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do)
-        #fn = lambda: triton_output.backward(do, retain_graph=True)
-        #fn()
+        fn = lambda: triton_output.backward(do, retain_graph=True)
+        fn()
         sdpa_output.backward(do, retain_graph=True)
 
-    #print(f'outputs allclose: {torch.allclose(sdpa_output, triton_output, atol=1e-1, rtol=1e-1)}')
+    print(f'outputs allclose: {torch.allclose(sdpa_output, triton_output, atol=1e-1, rtol=1e-1)}')
     if backward:
-        #print(f'q_torch.grad: {q_torch.grad}')
-        #print(f'q.grad: {q.grad}')
-        #print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
-        #print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
-        #print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
+        print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
+        print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
         print(f'------output sanity checking------')
         print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
@@ -148,7 +146,7 @@ if __name__ == '__main__':
     BATCH=1
     Q_H=2 ## Toggle to 1 to have normal MHSA.
     KV_H=4
-    N_CTX=17
+    N_CTX=16
     HEAD_DIM=16
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -157,5 +155,5 @@ if __name__ == '__main__':
     k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     #_debug_triton_fused_mhsa(q,k,v, backward=True, causal=causal)
-    _debug_triton_fused_gqa_mhsa(q,k,v,backward=True,causal=causal)
+    _debug_triton_fused_gqa_mhsa(q,k,v,backward=False,causal=causal)
 

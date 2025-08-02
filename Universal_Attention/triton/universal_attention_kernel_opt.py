@@ -33,7 +33,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, causal: tl.constexpr):
+                    N_CTX: tl.constexpr, causal: tl.constexpr, KV_H: tl.constexpr, Q_H: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
         lo, hi = 0, start_m * BLOCK_M
@@ -96,6 +96,8 @@ def _attn_fwd(sm_scale, M,  #
               STAGE: tl.constexpr,  #
               warp_specialize: tl.constexpr,  #
               causal: tl.constexpr,
+              KV_H: tl.constexpr,
+              Q_H: tl.constexpr
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
@@ -104,8 +106,10 @@ def _attn_fwd(sm_scale, M,  #
     off_z = off_hz // H
     off_h = off_hz % H
 
-    offset_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
-    qo_offset_y = offset_y + start_m * BLOCK_M * HEAD_DIM
+    offsetqo_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
+    qo_offset_y = offsetqo_y + start_m * BLOCK_M * HEAD_DIM
+    ## Compute offset_y of k/v taking into account GQA. ##
+    offset_y = off_z * (N_CTX * H * HEAD_DIM) + (off_h % KV_H) * N_CTX * HEAD_DIM
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
@@ -127,14 +131,14 @@ def _attn_fwd(sm_scale, M,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        4 - STAGE, offs_m, offs_n, N_CTX, causal)
+                                        4 - STAGE, offs_m, offs_n, N_CTX, causal, KV_H, Q_H)
     # stage 2: on-band
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
                                         desc_k, desc_v,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
-                                        2, offs_m, offs_n, N_CTX, causal)
+                                        2, offs_m, offs_n, N_CTX, causal, KV_H, Q_H)
     # epilogue
     m_i += tl.math.log(l_i)
     acc = acc / l_i[:, None]
@@ -380,7 +384,7 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
         assert causal, 'currently, only support causal-autoregressive style generation only.'
-        assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths.'
+        assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -391,6 +395,7 @@ class _attention(torch.autograd.Function):
         stage = 3 if causal else 1
         extra_kern_args = {}
         # Tuning for AMD target
+        KV_H, Q_H = k.shape[1], q.shape[1]
 
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32) ## (batch, head, sequence).
         desc_q = q
@@ -419,6 +424,8 @@ class _attention(torch.autograd.Function):
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             causal=causal,
+            KV_H=KV_H,
+            Q_H=Q_H,
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
