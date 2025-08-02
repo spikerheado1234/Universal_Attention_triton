@@ -28,7 +28,7 @@ def sdpa_gqa_torch(q, k, v, causal=False):
     assert q.shape[1] % k.shape[1] == 0, 'Incorrect number of heads for gqa passed in.'
     incoming_query_shape = q.shape
     q = torch.reshape(q, shape=(q.shape[0], q.shape[1] // k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
-    qk = torch.einsum('brnqh, bnkh -> brnqk', q, k)/torch.full((q.shape[0],q.shape[1],q.shape[2],k.shape[2]), sqrt(q.shape[-1])).to(q.device) ## S
+    qk = torch.einsum('brnqh, bnkh -> brnqk', q, k)/torch.full((q.shape[0], q.shape[1], q.shape[2], q.shape[3], k.shape[2]), sqrt(q.shape[-1])).to(q.device) ## S
     if causal:
         qk += torch.triu(torch.full(qk.shape, -1e6), diagonal=1).to(q.device)
     attn = torch.nn.functional.softmax(qk, dim=-1,dtype=torch.float32) ## P
@@ -37,7 +37,9 @@ def sdpa_gqa_torch(q, k, v, causal=False):
 
 def sdpa_gqa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     ## Compute the gradient of v & attn ##
-    incoming_gradients = torch.reshape(incoming_gradients, (q.shape[0], q.shape[1] / k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
+    assert q.shape[1] % k.shape[1] == 0, 'Incorrect number of heads for gqa passed in.'
+    incoming_gradients = torch.reshape(incoming_gradients, (q.shape[0], q.shape[1] // k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
+    q = torch.reshape(q, shape=(q.shape[0], q.shape[1] // k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
     o = torch.reshape(o, incoming_gradients.shape)
     dv = torch.einsum('brnqk, brnqh -> bnkh', attn, incoming_gradients)
     dattn = torch.einsum('brnqh, bnkh -> brnqk', incoming_gradients, v)
@@ -48,10 +50,10 @@ def sdpa_gqa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     dqk = (attn * dattn) - (torch.unsqueeze(d, dim=-1) * attn)  ## Check the correctness of this, may be incorrect.
 
     ## Finally, we compute dq and dk. ##
-    dq = torch.einsum('brnqk, bnkt -> bnqt', dqk, k) / torch.full(q.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
-    dk = torch.einsum('brnkq, bnkt -> bnqt', dqk, q) / torch.full(k.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
+    dq = torch.einsum('brnqk, bnkt -> brnqt', dqk, k) / torch.full(incoming_gradients.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
+    dk = torch.einsum('brnkq, brnkt -> bnqt', dqk, q) / torch.full(k.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
 
-    return dq, dk, dv 
+    return torch.reshape(dq, (dq.shape[0], dq.shape[1] * dq.shape[2], dq.shape[3], dq.shape[4])) ,  dk, dv 
 
 
 def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
