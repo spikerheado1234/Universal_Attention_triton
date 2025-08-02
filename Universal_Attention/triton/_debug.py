@@ -53,7 +53,7 @@ def sdpa_gqa_torch_bwd(attn, k, v, q, o, incoming_gradients):
     dq = torch.einsum('brnqk, bnkt -> brnqt', dqk, k) / torch.full(incoming_gradients.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
     dk = torch.einsum('brnkq, brnkt -> bnqt', dqk, q) / torch.full(k.shape, sqrt(q.shape[-1])).to(q.device).to(dtype=q.dtype)
 
-    return torch.reshape(dq, (dq.shape[0], dq.shape[1] * dq.shape[2], dq.shape[3], dq.shape[4])) ,  dk, dv 
+    return torch.reshape(dq, (dq.shape[0], dq.shape[1] * dq.shape[2], dq.shape[3], dq.shape[4])), dk, dv 
 
 
 def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
@@ -104,10 +104,11 @@ def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
-        print(f'------output sanity checking------')
-        print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
+        ## Comment out since correctness with ground truth has been affirmed ##
+        #print(f'------output sanity checking------')
+        #print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
+        #print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
+        #print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
 
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
@@ -133,21 +134,15 @@ def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
-        print(f'------output sanity checking------')
-        print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
+        ## Comment out since correctness with ground truth has been affirmed ##
+        #print(f'------output sanity checking------')
+        #print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
+        #print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
+        #print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
 
 
-
-if __name__ == '__main__':
-    ## Here we call whatever we would like to debug. We instantiate with debug sized tensors. ##
-    torch.manual_seed(0)
-    BATCH=1
-    Q_H=2 ## Toggle to 1 to have normal MHSA.
-    KV_H=4
-    N_CTX=16
-    HEAD_DIM=16
+def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
+    print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
     dtype=torch.float16
@@ -155,5 +150,34 @@ if __name__ == '__main__':
     k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     #_debug_triton_fused_mhsa(q,k,v, backward=True, causal=causal)
-    _debug_triton_fused_gqa_mhsa(q,k,v,backward=False,causal=causal)
+    _debug_triton_fused_gqa_mhsa(q,k,v,backward=backward,causal=causal)
+
+
+if __name__ == '__main__':
+    ## Here we call whatever we would like to debug. We instantiate with debug sized tensors. ##
+    torch.manual_seed(0)
+    ## Sample configuration. 8 total query heads and 4 kv heads. ##
+    BATCH=1
+    Q_H=2 ## Toggle to 1 to have normal MHSA.
+    KV_H=4
+    N_CTX=16
+    HEAD_DIM=16
+    ## Test case called with following params:
+    ##  1. BATCH
+    ##  2. Q_H -> Number of query-head groups (Set to 1 for MHSA).
+    ##  3. KV_H -> Number of KV_head groups.
+    ##  4. N_CTX -> context length.
+    ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
+    test_case(1, 2, 4, 16, 16, backward=False)
+    test_case(32, 2, 4, 16, 16, backward=False)
+    test_case(32, 2, 4, 1024, 16, backward=False)
+    test_case(32, 2, 4, 1024, 128, backward=False)
+    test_case(32, 8, 4, 4096, 128, backward=False)
+    test_case(32, 1, 32, 4096, 128, backward=False)
+    test_case(1, 2, 4, 16, 16, backward=True)
+    test_case(32, 2, 4, 16, 16, backward=True)
+    test_case(32, 2, 4, 1024, 16, backward=True)
+    test_case(32, 2, 4, 1024, 128, backward=True)
+    test_case(32, 8, 4, 4096, 128, backward=True)
+    test_case(32, 1, 32, 4096, 128, backward=True)
 
