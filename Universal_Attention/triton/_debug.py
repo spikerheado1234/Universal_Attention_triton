@@ -170,6 +170,9 @@ if __name__ == '__main__':
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
     test_case(1, 2, 4, 16, 16, backward=False)
     test_case(32, 2, 4, 16, 16, backward=False)
+    test_case(2, 2, 4, 32, 128, backward=False)
+    test_case(2, 2, 4, 128, 128, backward=False)
+    test_case(1, 2, 4, 1024, 16, backward=False)
     test_case(32, 2, 4, 1024, 16, backward=False)
     test_case(32, 2, 4, 1024, 128, backward=False)
     test_case(2, 8, 4, 4096, 128, backward=False)

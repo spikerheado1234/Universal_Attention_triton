@@ -109,7 +109,7 @@ def _attn_fwd(sm_scale, M,  #
     offsetqo_y = off_z * (N_CTX * H * HEAD_DIM) + off_h * N_CTX * HEAD_DIM
     qo_offset_y = offsetqo_y + start_m * BLOCK_M * HEAD_DIM
     ## Compute offset_y of k/v taking into account GQA. ##
-    offset_y = off_z * (N_CTX * H * HEAD_DIM) + (off_h % KV_H) * N_CTX * HEAD_DIM
+    offset_y = off_z * (N_CTX * KV_H * HEAD_DIM) + (off_h % KV_H) * N_CTX * HEAD_DIM
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
