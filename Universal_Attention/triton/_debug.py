@@ -78,38 +78,6 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
 
     return dq, dk, dv 
 
-def _debug_triton_fused_mhsa(q,k,v, backward=False, causal=False):
-    ## We clone and detach the tensors for grad checking. ##
-    q_torch = q.clone().detach().requires_grad_(True)
-    k_torch = k.clone().detach().requires_grad_(True)
-    v_torch = v.clone().detach().requires_grad_(True)
-    sdpa_output, attn = sdpa_torch(q_torch, k_torch, v_torch, causal)
-    q_sanity = q.clone().detach().requires_grad_(True)
-    k_sanity = k.clone().detach().requires_grad_(True)
-    v_sanity = v.clone().detach().requires_grad_(True)
-    sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale)
-    do = torch.randn_like(q).to(q.device)
-    triton_output = fn()
-    if backward:
-        dq_sanity, dk_sanity, dv_sanity = sdpa_torch_bwd(attn, k_sanity, v_sanity, q_sanity, sdpa_output, do)
-        fn = lambda: triton_output.backward(do, retain_graph=True)
-        fn()
-        sdpa_output.backward(do, retain_graph=True)
-
-    print(f'outputs allclose: {torch.allclose(sdpa_output, triton_output, atol=1e-1, rtol=1e-1)}')
-    if backward:
-        #print(f'q_torch.grad: {q_torch.grad}')
-        #print(f'q.grad: {q.grad}')
-        print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
-        print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
-        ## Comment out since correctness with ground truth has been affirmed ##
-        #print(f'------output sanity checking------')
-        #print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
-        #print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
-        #print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
-
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
     q_torch = q.clone().detach().requires_grad_(True)
