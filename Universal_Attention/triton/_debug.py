@@ -102,11 +102,6 @@ def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
-        ## Comment out since correctness with ground truth has been affirmed ##
-        #print(f'------output sanity checking------')
-        #print(f'dq allclose: {torch.allclose(q_torch.grad, dq_sanity, atol=1e-1, rtol=1e-1)}')
-        #print(f'dk allclose: {torch.allclose(k_torch.grad, dk_sanity, atol=1e-1, rtol=1e-1)}')
-        #print(f'dv allclose: {torch.allclose(v_torch.grad, dv_sanity, atol=1e-1, rtol=1e-1)}')
 
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
@@ -117,7 +112,6 @@ def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     q = torch.randn((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    #_debug_triton_fused_mhsa(q,k,v, backward=True, causal=causal)
     _debug_triton_fused_gqa_mhsa(q,k,v,backward=backward,causal=causal)
 
 
@@ -156,4 +150,3 @@ if __name__ == '__main__':
     test_case(32, 2, 4, 1024, 128, backward=True)
     test_case(2, 8, 4, 4096, 128, backward=True)
     test_case(2, 1, 32, 4096, 128, backward=True)
-
