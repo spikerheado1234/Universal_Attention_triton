@@ -282,7 +282,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 
     bhid = tl.program_id(2)
     off_chz = (bhid * N_CTX).to(tl.int64)
-    adj_KV = (stride_h * (bhid % KV_H) + stride_z * (bhid // (Q_H * KV_H))).to(tl.int64) ## Is this correct? Seems like there may be an indexing issue here.
+    adj_KV = (stride_h * (bhid % KV_H) + (HEAD_DIM * N_CTX * KV_H) * (bhid // (Q_H * KV_H))).to(tl.int64) ## Is this correct? Seems like there may be an indexing issue here.
     adj_Q = (stride_h * (bhid % (Q_H * KV_H)) + stride_z * (bhid // (Q_H * KV_H))).to(tl.int64)
     pid = tl.program_id(0)
 
