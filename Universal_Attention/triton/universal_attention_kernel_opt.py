@@ -191,7 +191,7 @@ def _attn_bwd_dkdv(dk, dv,  #
             offs_m = curr_m + tl.arange(0, BLOCK_M1)
             qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX))
             # Load m before computing qk to reduce pipeline stall.
-            m = tl.load(M + offs_m, mask=offs_m < N_CTX)
+            m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX)
             qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
             pT = tl.math.exp(qkT - m[None, :])
             # Autoregressive masking.
@@ -320,8 +320,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
 
         dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q, k, v, sm_scale,  #
-                            DO,  #
+                            Q + (stride_h * (bhid % KV_H)).to(tl.int64), k, v, sm_scale,  # Correctly point the necessary KV_H channel.
+                            DO + (stride_h * (bhid % KV_H)).to(tl.int64),  # Correctly point to the necessary KV_H channel.
                             M, D,  #
                             stride_tok, stride_d,  #
                             Q_H, KV_H, N_CTX,  #
@@ -336,8 +336,8 @@ def _attn_bwd(Q, K, V, sm_scale,  #
         # Compute dK and dV for non-masked blocks.
         dk, dv = _attn_bwd_dkdv(  #
             dk, dv,  #
-            Q, k, v, sm_scale,  #
-            DO,  #
+            Q + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64), k, v, sm_scale,  #
+            DO + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64),  #
             M, D,  #
             stride_tok, stride_d,  #
             Q_H, KV_H, N_CTX,  #
