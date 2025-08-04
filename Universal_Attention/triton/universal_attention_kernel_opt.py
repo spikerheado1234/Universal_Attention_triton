@@ -29,15 +29,21 @@ def get_cuda_configs():
 
 @triton.jit
 def _ua_fwd_kernel(
-    XQ, KC, VC, STATIC_SRC, STATIC_DEST, O, DENOM,
-    s_xq_b, s_xq_h, s_xq_r, s_xq_n, s_xq_c, s_xq_d,
-    s_kc_b, s_kc_h, s_kc_n, s_kc_c, s_kc_d,
-    s_vc_b, s_vc_h, s_vc_n, s_vc_c, s_vc_d,
-    s_ss_b, s_ss_h, s_ss_n, s_ss_c,
-    s_sd_b, s_sd_h, s_sd_n, s_sd_c,
-    s_o_b, s_o_h, s_o_r, s_o_l, s_o_d, s_o_n,
-    s_d_b, s_d_h, s_d_r, s_d_l, s_d_n,
-    b, h, r, _n, _c, d, n_, c_,
+    # Pointers to Tensors
+    Q, K, V, STATIC_SRC, STATIC_DEST, O, DENOM,
+    # Strides
+    s_q_b, s_q_h, s_q_n, s_q_d,
+    s_k_b, s_k_h, s_k_n, s_k_d,
+    s_v_b, s_v_h, s_v_n, s_v_d,
+    s_ss_b, s_ss_h, s_ss_n,
+    s_sd_b, s_sd_h, s_sd_n,
+    s_o_b, s_o_h, s_o_n, s_o_d,
+    s_d_b, s_d_h, s_d_n,
+    # Shape and GQA Parameters
+    KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, Q_H: tl.constexpr,
+    # Chunking Parameters
+    n_: tl.constexpr, c_: tl.constexpr, _n: tl.constexpr, _c: tl.constexpr,
+    # Dtype
     DTYPE: tl.constexpr,
 ):
     i = tl.program_id(0)
@@ -510,7 +516,9 @@ class _attention(torch.autograd.Function):
             dtype = tl.float16 if q.dtype == torch.float16 else tl.float32
 
             _ua_fwd_kernel[grid](
+                # Tensors
                 q, k, v, static_src, static_dest, o, denom,
+                # Strides
                 q.stride(0), q.stride(1), q.stride(2), q.stride(3),
                 k.stride(0), k.stride(1), k.stride(2), k.stride(3),
                 v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -518,6 +526,7 @@ class _attention(torch.autograd.Function):
                 static_dest.stride(0), static_dest.stride(1), static_dest.stride(2),
                 o.stride(0), o.stride(1), o.stride(2), o.stride(3),
                 denom.stride(0), denom.stride(1), denom.stride(2),
+                # Parameters
                 KV_HEADS, HEAD_DIM, Q_H,
                 n_, c_, _n, _c,
                 DTYPE=dtype,
