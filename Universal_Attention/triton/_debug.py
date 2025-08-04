@@ -3,6 +3,8 @@ import torch
 from universal_attention_kernel_opt import attention
 from math import sqrt
 import pdb
+from universal_attention_kernel import universal_attention_forward
+from math import ceil
 
 def sdpa_torch(q, k, v, causal=False):
     """
@@ -103,6 +105,29 @@ def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
 
+def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
+    assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
+    q_torch = q.clone().detach().requires_grad_(True)
+    k_torch = k.clone().detach().requires_grad_(True)
+    v_torch = v.clone().detach().requires_grad_(True)
+    static_src = static_src.clone().detach().requires_grad_(True)
+    static_dest = static_dest.clone().detach().requires_grad_(True)
+    c_, _c = 16, 16
+    n_, _n = ceil(q.shape[2] / c_), ceil(q.shape[2] / _c)
+    q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1], _n, _c, q_torch.shape[-1]))
+    k_torch = torch.reshape(k_torch, (k_torch.shape[0], k_torch.shape[1], n_, c_, k_torch.shape[-1]))
+    v_torch = torch.reshape(v_torch, (v_torch.shape[0], v_torch.shape[1], n_, c_, v_torch.shape[-1]))
+    static_src = torch.reshape(static_src, (static_src.shape[0], static_src.shape[1], n_, c_))
+    static_dest = torch.reshape(static_dest, (static_dest.shape[0], static_dest.shape[1], _n, _c))
+    out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src,static_dest)
+    torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
+    sm_scale = 1.3
+    fn = lambda: attention(q, k, v, causal, sm_scale)
+    triton_output = attention()
+    print(f'outputs allclose: {torch.allclose(triton_output, torch_output, atol=1e-1, rtol=1e-1)}')
+    if backward:
+        pass ## This is not implemented yet.
+
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
@@ -113,6 +138,18 @@ def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     _debug_triton_fused_gqa_mhsa(q,k,v,backward=backward,causal=causal)
+
+def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
+    print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
+    causal = True
+    device="cuda" if torch.cuda.is_available() else "cpu"
+    dtype=torch.float16
+    q = torch.randn((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    static_src = torch.randn((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    static_dest = torch.randn((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
 
 
 if __name__ == '__main__':
@@ -130,6 +167,9 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
+    test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
+
+    ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
     test_case(1, 2, 4, 16, 16, backward=False)
     #test_case(1, 2, 4, 17, 16, backward=False)
     test_case(32, 2, 4, 16, 16, backward=False)
