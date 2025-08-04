@@ -62,7 +62,7 @@ def _ua_fwd_kernel(
     k_ = tl.load(ptr_k_ + offs_c_[:, None] * s_kc_c + offs_d[None, :] * s_kc_d)
     v_ = tl.load(ptr_v_ + offs_c_[:, None] * s_vc_c + offs_d[None, :] * s_vc_d)
     static_src_ = tl.load(ptr_ss_ + offs_c_ * s_ss_c)
-    static_src_ = tl.math.pow(static_src_.to(tl.float32), 1/3)
+    static_src = tl.exp2(tl.log2(static_src_.to(tl.float32)) / 3.0)
 
     sum_buffer = tl.zeros((c_,), dtype=tl.float32)
     offs__c = tl.arange(0, _c)
@@ -76,11 +76,11 @@ def _ua_fwd_kernel(
         q_ = tl.load(ptr_q + offs__c[:, None] * s_xq_c + offs_d[None, :] * s_xq_d)
         _kt_j = tl.load(ptr_kt_j + offs__c[:, None] * s_kc_c + offs_d[None, :] * s_kc_d)
         _static_dest = tl.load(ptr_sd + offs__c * s_sd_c)
-        _static_dest = tl.math.pow(_static_dest.to(tl.float32), 1/3)
+        _static_dest = tl.exp2(tl.log2(_static_dest.to(tl.float32)) / 3)
         
         affinity = tl.dot(k_, tl.trans(_kt_j)).to(tl.float32)
         affinity = tl.where(affinity > 0, affinity, 0)
-        affinity = tl.math.pow(affinity, 2/3)
+        affinity = tl.exp2(tl.log2(affinity) * 2.0/3.0)
         affinity = affinity * static_src_[:, None] * _static_dest[None, :]
         
         affinity = tl.where(affinity > 1.0 - 1e-6, 1.0 - 1e-6, affinity)
