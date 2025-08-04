@@ -28,6 +28,92 @@ def get_cuda_configs():
     return configs
 
 @triton.jit
+def _ua_fwd_kernel(
+    XQ, KC, VC, STATIC_SRC, STATIC_DEST, O, DENOM,
+    s_xq_b, s_xq_h, s_xq_r, s_xq_n, s_xq_c, s_xq_d,
+    s_kc_b, s_kc_h, s_kc_n, s_kc_c, s_kc_d,
+    s_vc_b, s_vc_h, s_vc_n, s_vc_c, s_vc_d,
+    s_ss_b, s_ss_h, s_ss_n, s_ss_c,
+    s_sd_b, s_sd_h, s_sd_n, s_sd_c,
+    s_o_b, s_o_h, s_o_r, s_o_l, s_o_d, s_o_n,
+    s_d_b, s_d_h, s_d_r, s_d_l, s_d_n,
+    b, h, r, _n, _c, d, n_, c_,
+    DTYPE: tl.constexpr,
+):
+    i = tl.program_id(0)
+    bhr_idx = tl.program_id(1)
+
+    r_idx = bhr_idx % r
+    h_idx = (bhr_idx // r) % h
+    b_idx = bhr_idx // (h * r)
+
+    ptr_k_ = KC + b_idx*s_kc_b + h_idx*s_kc_h + i*s_kc_n
+    ptr_v_ = VC + b_idx*s_vc_b + h_idx*s_vc_h + i*s_vc_n
+    ptr_ss_ = STATIC_SRC + b_idx*s_ss_b + h_idx*s_ss_h + i*s_ss_n
+    
+    offs_c_ = tl.arange(0, c_)
+    offs_d = tl.arange(0, d)
+    k_ = tl.load(ptr_k_ + offs_c_[:, None] * s_kc_c + offs_d[None, :] * s_kc_d)
+    v_ = tl.load(ptr_v_ + offs_c_[:, None] * s_vc_c + offs_d[None, :] * s_vc_d)
+    static_src_ = tl.load(ptr_ss_ + offs_c_ * s_ss_c)
+    static_src_ = tl.math.pow(static_src_.to(tl.float32), 1/3)
+
+    sum_buffer = tl.zeros((c_,), dtype=tl.float32)
+    offs__c = tl.arange(0, _c)
+    
+    for j in range(0, _n):
+        ptr_q = XQ + b_idx*s_xq_b + h_idx*s_xq_h + r_idx*s_xq_r + j*s_xq_n
+        l_idx = j * _c
+        ptr_kt_j = KC + b_idx*s_kc_b + h_idx*s_kc_h + (l_idx // c_)*s_kc_n + (l_idx % c_)*s_kc_c
+        ptr_sd = STATIC_DEST + b_idx*s_sd_b + h_idx*s_sd_h + j*s_sd_n
+
+        q_ = tl.load(ptr_q + offs__c[:, None] * s_xq_c + offs_d[None, :] * s_xq_d)
+        _kt_j = tl.load(ptr_kt_j + offs__c[:, None] * s_kc_c + offs_d[None, :] * s_kc_d)
+        _static_dest = tl.load(ptr_sd + offs__c * s_sd_c)
+        _static_dest = tl.math.pow(_static_dest.to(tl.float32), 1/3)
+        
+        affinity = tl.dot(k_, tl.trans(_kt_j)).to(tl.float32)
+        affinity = tl.where(affinity > 0, affinity, 0)
+        affinity = tl.math.pow(affinity, 2/3)
+        affinity = affinity * static_src_[:, None] * _static_dest[None, :]
+        
+        affinity = tl.where(affinity > 1.0 - 1e-6, 1.0 - 1e-6, affinity)
+        affinity = tl.log1p(-affinity)
+        
+        global_k_indices = i * c_ + tl.arange(0, c_)
+        global_q_indices = j * _c + tl.arange(0, _c)
+        
+        cumsum_mask = (global_k_indices[:, None] >= (global_q_indices[None, :] + 1))
+        affinity = tl.where(cumsum_mask, affinity, 0.0)
+        affinity = tl.cumsum(affinity, axis=1)
+        
+        affinity = affinity + sum_buffer[:, None]
+        
+        if _c > 0:
+            last_col_offsets = (tl.arange(0, c_) * _c) + (_c - 1)
+            sum_buffer = tl.load(affinity.ptr + last_col_offsets)
+
+        remask = (global_k_indices[:, None] <= (global_q_indices[None, :] - 1))
+        affinity = tl.where(remask, -1e12, affinity)
+
+        score = tl.dot(k_, tl.trans(q_)).to(tl.float32)
+        score = score + affinity
+
+        m = tl.max(score, axis=0)
+        lse = m + tl.log(tl.sum(tl.exp(score - m[None,:]), axis=0))
+        
+        probs = tl.exp(score - lse[None, :])
+        _out = tl.dot(tl.trans(probs.to(DTYPE)), v_)
+
+        ptr_o_base = O + b_idx*s_o_b + h_idx*s_o_h + r_idx*s_o_r + i*s_o_n
+        ptr_o = ptr_o_base + (j*_c + offs__c[:, None]) * s_o_l + offs_d[None, :] * s_o_d
+        ptr_denom_base = DENOM + b_idx*s_d_b + h_idx*s_d_h + r_idx*s_d_r + i*s_d_n
+        ptr_denom = ptr_denom_base + (j*_c + offs__c) * s_d_l
+        
+        tl.store(ptr_o, _out)
+        tl.store(ptr_denom, lse)
+
+@triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     desc_k, desc_v,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
@@ -392,57 +478,103 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
-        assert causal, 'currently, only support causal-autoregressive style generation only.'
-        assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
-        # shape constraints
-        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
-        # when v is in float8_e5m2 it is transposed.
-        HEAD_DIM_V = v.shape[-1]
-        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
-        o = torch.empty_like(q)
-        stage = 3 if causal else 1
-        extra_kern_args = {}
-        # Tuning for AMD target
-        KV_H, Q_H = k.shape[1], q.shape[1]
+    def forward(ctx, q, k, v, causal, sm_scale, universal=False, static_src=None, static_dest=None, warp_specialize=True):
 
-        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32) ## (batch, head, sequence).
-        desc_q = q
-        desc_v = v
-        desc_k = k
-        desc_o = o
+        if universal:
+            # Universal Attention Path
+            # q: (b, q_heads, N_CTX, d)
+            # k: (b, kv_heads, N_CTX, d)
+            # v: (b, kv_heads, N_CTX, d)
+            # static_src: (b, kv_heads, N_CTX)
+            # static_dest: (b, kv_heads, N_CTX)
+            BATCH, Q_HEADS, N_CTX, HEAD_DIM = q.shape
+            _, KV_HEADS, _, _ = k.shape
+            
+            # CHUNK_SIZE is the block size for sequence splitting.
+            # This is analogous to BLOCK_M/BLOCK_N in standard FlashAttention,
+            # but defines the blocks for the recurrent calculation.
+            CHUNK_SIZE = 64
+            assert N_CTX % CHUNK_SIZE == 0, "Sequence length must be divisible by CHUNK_SIZE"
+            c_ = CHUNK_SIZE
+            _c = CHUNK_SIZE
+            n_ = N_CTX // c_
+            _n = N_CTX // _c
+            
+            Q_H = Q_HEADS // KV_HEADS
 
-        #def grid(META):
-        #    return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+            o = torch.empty_like(q)
+            denom = torch.empty((BATCH, Q_HEADS, N_CTX), dtype=torch.float32, device=q.device)
 
-        BLOCK_M=16
-        BLOCK_N=16
-        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+            grid = (n_, BATCH * KV_HEADS)
+            
+            dtype = tl.float16 if q.dtype == torch.float16 else tl.float32
 
-        ctx.grid = grid
+            _ua_fwd_kernel[grid](
+                q, k, v, static_src, static_dest, o, denom,
+                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+                static_src.stride(0), static_src.stride(1), static_src.stride(2),
+                static_dest.stride(0), static_dest.stride(1), static_dest.stride(2),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                denom.stride(0), denom.stride(1), denom.stride(2),
+                KV_HEADS, HEAD_DIM, Q_H,
+                n_, c_, _n, _c,
+                DTYPE=dtype,
+            )
+            ctx.save_for_backward(q, k, v, static_src, static_dest)
+            return o, denom
+        else:
+            assert causal, 'currently, only support causal-autoregressive style generation only.'
+            assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
+            # shape constraints
+            HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+            # when v is in float8_e5m2 it is transposed.
+            HEAD_DIM_V = v.shape[-1]
+            assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+            assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+            o = torch.empty_like(q)
+            stage = 3 if causal else 1
+            extra_kern_args = {}
+            # Tuning for AMD target
+            KV_H, Q_H = k.shape[1], q.shape[1]
 
-        _attn_fwd[grid](
-            sm_scale, M,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
-            N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
-            BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            STAGE=stage,  #
-            warp_specialize=warp_specialize,  #
-            causal=causal,
-            KV_H=KV_H,
-            Q_H=Q_H,
-            **extra_kern_args)
+            M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32) ## (batch, head, sequence).
+            desc_q = q
+            desc_v = v
+            desc_k = k
+            desc_o = o
 
-        ctx.save_for_backward(q, k, v, o, M)
-        ctx.sm_scale = sm_scale
-        ctx.HEAD_DIM = HEAD_DIM_K
-        ctx.causal = causal
-        return o
+            #def grid(META):
+            #    return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+
+            BLOCK_M=16
+            BLOCK_N=16
+            grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+
+            ctx.grid = grid
+
+            _attn_fwd[grid](
+                sm_scale, M,  #
+                q.shape[0], q.shape[1],  #
+                desc_q, desc_k, desc_v, desc_o,  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
+                BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                STAGE=stage,  #
+                warp_specialize=warp_specialize,  #
+                causal=causal,
+                KV_H=KV_H,
+                Q_H=Q_H,
+                **extra_kern_args)
+
+            ctx.save_for_backward(q, k, v, o, M)
+            ctx.sm_scale = sm_scale
+            ctx.HEAD_DIM = HEAD_DIM_K
+            ctx.causal = causal
+            return o
 
     @staticmethod
     def backward(ctx, do):
