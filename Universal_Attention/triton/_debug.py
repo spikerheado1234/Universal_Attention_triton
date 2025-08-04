@@ -114,7 +114,8 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     static_dest = static_dest.clone().detach().requires_grad_(True)
     c_, _c = 16, 16
     n_, _n = ceil(q.shape[2] / c_), ceil(q.shape[2] / _c)
-    q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1], _n, _c, q_torch.shape[-1]))
+    q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1] // k_torch.shape[1], k_torch.shape[1], _n, _c, q_torch.shape[-1]))
+    q_torch = q_torch.transpose(1, 2)
     k_torch = torch.reshape(k_torch, (k_torch.shape[0], k_torch.shape[1], n_, c_, k_torch.shape[-1]))
     v_torch = torch.reshape(v_torch, (v_torch.shape[0], v_torch.shape[1], n_, c_, v_torch.shape[-1]))
     static_src_torch = torch.reshape(static_src, (static_src.shape[0], static_src.shape[1], n_, c_))
@@ -122,7 +123,7 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
     torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale, universal=True, static_src=static_src, static_dest=static_dest)
+    fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
     triton_output, triton_denom = fn()
     print(f'outputs allclose: {torch.allclose(triton_output, torch_output, atol=1e-1, rtol=1e-1)}')
     print(f'denom allclose: {torch.allclose(triton_denom, denom, atol=1e-1, rtol=1e-1)}')
@@ -168,7 +169,7 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
-    test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
+    test_case_universal_attention(1, 2, 4, 1024, 128, backward=False)
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
    # test_case(1, 2, 4, 16, 16, backward=False)

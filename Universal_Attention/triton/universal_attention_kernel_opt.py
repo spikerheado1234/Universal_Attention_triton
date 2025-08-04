@@ -493,7 +493,7 @@ class _attention(torch.autograd.Function):
             # CHUNK_SIZE is the block size for sequence splitting.
             # This is analogous to BLOCK_M/BLOCK_N in standard FlashAttention,
             # but defines the blocks for the recurrent calculation.
-            CHUNK_SIZE = 64
+            CHUNK_SIZE = 16
             assert N_CTX % CHUNK_SIZE == 0, "Sequence length must be divisible by CHUNK_SIZE"
             c_ = CHUNK_SIZE
             _c = CHUNK_SIZE
