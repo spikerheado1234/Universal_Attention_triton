@@ -125,8 +125,6 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
     triton_output = fn()
-    print(f'triton output: {triton_output}')
-    print(f'torch output: {torch_output.view(triton_output.shape)}')
     print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
     if backward:
         pass ## This is not implemented yet. TODO(ahangupta).
@@ -171,6 +169,7 @@ if __name__ == '__main__':
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
     test_case_universal_attention(1, 1, 1, 16, 16, backward=False)
+    test_case_universal_attention(1, 1, 1, 32, 16, backward=False)
     #test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
