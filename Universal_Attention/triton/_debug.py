@@ -124,9 +124,8 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
-    triton_output, triton_denom = fn()
-    print(f'outputs allclose: {torch.allclose(triton_output, torch_output, atol=1e-1, rtol=1e-1)}')
-    print(f'denom allclose: {torch.allclose(triton_denom, denom, atol=1e-1, rtol=1e-1)}')
+    triton_output = fn()
+    print(f'outputs allclose: {torch.allclose(triton_output, torch_output.view(triton_output.shape), atol=1e-1, rtol=1e-1)}')
     if backward:
         pass ## This is not implemented yet. TODO(ahangupta).
 

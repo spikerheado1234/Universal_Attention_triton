@@ -32,7 +32,7 @@ def _gen_affinity_scores(k, src, dest):
     affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
-    return affinity.masked_fill(torch.ones_like(affinity).tril(-1), -1e12)
+    return affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #

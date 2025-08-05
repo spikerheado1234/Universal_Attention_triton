@@ -5,6 +5,7 @@ import triton.language as tl
 import numpy as np
 import inspect
 import time
+import pdb
 
 configs = [
     triton.Config({'BLOCK_D': BLOCK_D}, num_stages=stages, num_warps=warps) \
