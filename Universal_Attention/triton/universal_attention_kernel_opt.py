@@ -33,7 +33,8 @@ def _gen_affinity_scores(k, src, dest):
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
     print(f'affinity: {torch.nan_to_num(affinity).sum()}')
-    return affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12)
+    affinity = affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12)
+    return affinity.transpose(-1, -2)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -442,6 +443,7 @@ class _attention(torch.autograd.Function):
         ctx.grid = grid
 
         desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
+        pdb.set_trace()
 
         _attn_fwd[grid](
             sm_scale, M,  #

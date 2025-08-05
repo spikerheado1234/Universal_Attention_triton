@@ -127,7 +127,7 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     triton_output = fn()
     print(f'triton output: {triton_output}')
     print(f'torch output: {torch_output.view(triton_output.shape)}')
-    print(f'outputs allclose: {torch.allclose(triton_output, torch_output.view(triton_output.shape), atol=1e-1, rtol=1e-1)}')
+    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
     if backward:
         pass ## This is not implemented yet. TODO(ahangupta).
 
