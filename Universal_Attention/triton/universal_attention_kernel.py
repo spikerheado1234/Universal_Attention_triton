@@ -919,6 +919,11 @@ def universal_attention_forward(kc, vc, xq, static_src, static_dest):
 
             # Perform actual attention operation
             score = k_.unsqueeze(2).matmul(_q.transpose(-1,-2)).add(affinity.unsqueeze(2))  # b h r c_ _c
+            print(f'score-torch: {torch.nan_to_num(score).sum()}')
+            print(f'qk-torch: {torch.nan_to_num(k_.unsqueeze(2).matmul(_q.transpose(-1,-2))).sum()}')
+            print(f'affinity-torch: {affinity}')
+            print(f'qk-torch: {k_.unsqueeze(2).matmul(_q.transpose(-1,-2))}')
+            #print(f'score-torch: {score}')
             _denom_ = score.logsumexp(dim=-2)  # b h r _c
             _out_ = score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))  # b h r _c d
 

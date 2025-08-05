@@ -32,6 +32,7 @@ def _gen_affinity_scores(k, src, dest):
     affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
+    print(f'affinity: {torch.nan_to_num(affinity).sum()}')
     return affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12)
 
 @triton.jit
@@ -63,7 +64,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         ), other=0.0).to(tl.float32)
         k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
-        qk *= 1/tl.sqrt(tl.cast(HEAD_DIM, dtype=tl.float32)) 
+        pdb.set_trace()
+        #qk *= 1/tl.sqrt(tl.cast(HEAD_DIM, dtype=tl.float32)) 
         qk += aff
         if STAGE == 2:
             mask = (offs_m[:, None] >= (start_n + offs_n[None, :])) & ((start_n + offs_n[None, :]) < N_CTX) & (offs_m[:, None] < N_CTX)
