@@ -168,7 +168,7 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
-    test_case_universal_attention(1, 2, 4, 1024, 128, backward=False)
+    test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
    # test_case(1, 2, 4, 16, 16, backward=False)
