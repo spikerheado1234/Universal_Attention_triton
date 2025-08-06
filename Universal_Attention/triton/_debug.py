@@ -1,6 +1,6 @@
 ## File that has some debugging helpe functions. ##
 import torch
-from universal_attention_kernel_opt import attention
+from universal_attention_kernel_opt import attention, _gen_affinity_scores
 from math import sqrt
 import pdb
 from universal_attention_kernel import universal_attention_forward
@@ -80,6 +80,37 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
 
     return dq, dk, dv 
 
+## Currently untested. TODO(ahangupta): test this function. ##
+def ua_bwd(q, k, v, src, dest, incoming_gradients):
+    affinity = _gen_affinity_scores(k, src, dest)
+    qk = torch.einsum('bnqh, bnkh -> bnqk', q, k)
+    qk += affinity
+    attn = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
+    o = torch.einsum('bnqk, bnkh -> bnqh', attn.to(dtype=q.dtype), v)
+
+    ## Now, we compute the gradients. ##
+
+    ## dv. ##
+    dv = torch.einsum('brnqk, brnqh -> bnkh', attn, incoming_gradients)
+
+    ## dq/dk. ##
+    dattn = torch.einsum('bnqh, bnkh -> bnqk', incoming_gradients, v)
+    d = torch.sum(incoming_gradients * o, axis=-1)  ## (b, n, s) -> Similar sized shape to logsumexp.
+    dp = (attn * dattn) - (torch.unsqueeze(d, dim=-1) * attn) 
+    dq = torch.einsum('bnqk, bnkt -> bnqt', dp, k) 
+    dk = torch.einsum('bnkq, bnkt -> bnqt', dp, q)
+
+    ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
+    affinity.backward(torch.sum(torch.reshape(dp, (dp.shape[0], dp.shape[1] // k.shape[1], k.shape[1], dp.shape[2], dp.shape[3])), dim=1))
+    dk += k.grad
+    dsrc = src.grad
+    ddest = dest.grad
+
+    k.grad, src.grad, dest.grad = None, None, None
+
+    return dq, dk, dv, dsrc, ddest
+
+
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
     q_torch = q.clone().detach().requires_grad_(True)
@@ -125,9 +156,17 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
     triton_output = fn()
+    do = torch.randn_like(q).to(q.device)
     print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
     if backward:
-        pass ## This is not implemented yet. TODO(ahangupta).
+        torch_output.backward(do)
+        dq, dk, dv, dsrc, ddest = ua_bwd(q, k, v, static_src, static_dest, do)
+        print('------sanity-------')
+        print(f'dq allclose: {torch.allclose(q_torch.grad, dq.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(k_torch.grad, dk.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose: {torch.allclose(v_torch.grad, dv.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dsrc allclose: {torch.allclose(static_src_torch.grad, dsrc.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'ddest allclose: {torch.allclose(static_dest_torch.grad, ddest.grad, atol=1e-1, rtol=1e-1)}')
 
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
@@ -175,6 +214,7 @@ if __name__ == '__main__':
     test_case_universal_attention(6, 1, 1, 1024, 128, backward=False)
     test_case_universal_attention(6, 1, 4, 1024, 128, backward=False)
     test_case_universal_attention(6, 2, 4, 1024, 128, backward=False)
+    test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
     #test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##

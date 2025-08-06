@@ -32,7 +32,7 @@ def _gen_affinity_scores(k, src, dest):
     affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
-    return affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12)
+    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12), -1, -2).contiguous()
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -204,10 +204,10 @@ def _attn_bwd_dkdv(dk, dv,  #
         step_m = BLOCK_M1
         for blk_idx in range(num_steps):
             offs_m = curr_m + tl.arange(0, BLOCK_M1)
-            qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX))
+            qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX)) ## (HEAD, BLOCK_M1)
             # Load m before computing qk to reduce pipeline stall.
-            m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX)
-            qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+            m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX) ## (BLOCK_M1, )
+            qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32)) ## (BLOCK_N1, BLOCK_M1)
             pT = tl.math.exp(qkT - m[None, :])
             # Autoregressive masking.
             if MASK:
@@ -280,7 +280,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
     return dq
 
 @triton.jit
-def _attn_bwd(Q, K, V, sm_scale,  #
+def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
               DO,  #
               DQ, DK, DV,  #
               M, D,
@@ -307,6 +307,7 @@ def _attn_bwd(Q, K, V, sm_scale,  #
     DQ += adj_Q 
     DK += adj_KV
     DV += adj_KV
+    AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
     ## Adjust these to batch dimension only since we need to loop through the "r" dimension for GQA. ##
     Q += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
     DO += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
@@ -440,7 +441,6 @@ class _attention(torch.autograd.Function):
         ctx.grid = grid
 
         desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
-        desc_affinity = torch.transpose(desc_affinity, -1, -2).contiguous()
 
         _attn_fwd[grid](
             sm_scale, M,  #
@@ -458,7 +458,7 @@ class _attention(torch.autograd.Function):
             Q_H=Q_H,
             **extra_kern_args)
 
-        ctx.save_for_backward(q, k, v, o, M)
+        ctx.save_for_backward(q, k, v, o, M, static_src, static_dest)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
@@ -466,7 +466,7 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, M = ctx.saved_tensors
+        q, k, v, o, M, static_src, static_dest = ctx.saved_tensors
         assert do.is_contiguous()
         assert q.stride() == do.stride() == o.stride() and k.stride() == v.stride()
         dq = torch.empty_like(q)
@@ -488,12 +488,14 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
+        ## Recompute affinity scores. ##
+        affinity = _gen_affinity_scores(k, static_src, static_dest)
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
         _attn_bwd[grid](
-            q, k, v, scale, do, dq, dk, dv,  #
+            q, k, v, affinity, scale, do, dq, dk, dv,  #
             M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             Q_H, KV_H, N_CTX,  #
@@ -506,7 +508,8 @@ class _attention(torch.autograd.Function):
             num_stages=NUM_STAGES  #
         )
 
-        return dq, dk, dv, None, None, None, None
+        ## TODO(ahangupta): adjust to computing dsrc & ddest.
+        return dq, dk, dv, None, None, None, None, None, None, None
     
 attention = _attention.apply
 
