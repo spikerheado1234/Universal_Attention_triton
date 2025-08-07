@@ -1,12 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from torch.nn.functional import scaled_dot_product_attention
 
-import numpy as np
-import inspect
-import time
-from math import sqrt
 import pdb
 
 def is_hip():
@@ -113,7 +108,7 @@ def _attn_fwd(sm_scale, M,  #
               KV_H: tl.constexpr,
               Q_H: tl.constexpr
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
+    dtype = desc_q.dtype.element_ty
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     off_z = off_hz // H
@@ -445,7 +440,7 @@ class _attention(torch.autograd.Function):
             HEAD_DIM=HEAD_DIM_K,  #
             BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
             BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+            FP8_OUTPUT=False,
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             causal=causal,

@@ -148,16 +148,16 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     q_torch = q.clone().detach().requires_grad_(True)
     k_torch = k.clone().detach().requires_grad_(True)
     v_torch = v.clone().detach().requires_grad_(True)
-    static_src = static_src.clone().detach().requires_grad_(True)
-    static_dest = static_dest.clone().detach().requires_grad_(True)
+    static_src_torch = static_src.clone().detach().requires_grad_(True)
+    static_dest_torch = static_dest.clone().detach().requires_grad_(True)
     c_, _c = 16, 16
     n_, _n = ceil(q.shape[2] / c_), ceil(q.shape[2] / _c)
     q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1] // k_torch.shape[1], k_torch.shape[1], _n, _c, q_torch.shape[-1]))
     q_torch = q_torch.transpose(1, 2)
     k_torch = torch.reshape(k_torch, (k_torch.shape[0], k_torch.shape[1], n_, c_, k_torch.shape[-1]))
     v_torch = torch.reshape(v_torch, (v_torch.shape[0], v_torch.shape[1], n_, c_, v_torch.shape[-1]))
-    static_src_torch = torch.reshape(static_src, (static_src.shape[0], static_src.shape[1], n_, c_))
-    static_dest_torch = torch.reshape(static_dest, (static_dest.shape[0], static_dest.shape[1], _n, _c))
+    static_src_torch = torch.reshape(static_src_torch, (static_src_torch.shape[0], static_src_torch.shape[1], n_, c_))
+    static_dest_torch = torch.reshape(static_dest_torch, (static_dest_torch.shape[0], static_dest_torch.shape[1], _n, _c))
     out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
     torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     sm_scale = 1.3
@@ -257,8 +257,6 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'torch-ua-bwd: {torch_ua_bwd_end-torch_ua_bwd_start}')
         print(f'triton-ua-bwd: {triton_ua_bwd_end-triton_ua_bwd_start}')
 
-
-
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
     causal = True
@@ -273,7 +271,7 @@ def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=Fa
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
-    dtype=torch.bfloat16
+    dtype=torch.float32
     q = torch.rand((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
