@@ -487,14 +487,11 @@ class _attention(torch.autograd.Function):
         )
         ## Recompute affinity scores. ##
         ## Turn on autodiff for this. ##
-        print(f'point one: {k.requires_grad}')
-        print(f'point two: {k.requires_grad}')
-        #with torch.enable_grad():
-        k_detch = k.clone().detach().requires_grad_(True)
-        src_detch = static_src.clone().detach().requires_grad_(True)
-        dest_detch = static_dest.clone().detach().requires_grad_(True)
-        affinity = _gen_affinity_scores(k_detch, src_detch, dest_detch) ## (b, KV_H, N_CTX, N_CTX)
-        print(f'point three: {k.requires_grad}')
+        with torch.enable_grad():
+            k_detch = k.clone().detach().requires_grad_(True)
+            src_detch = static_src.clone().detach().requires_grad_(True)
+            dest_detch = static_dest.clone().detach().requires_grad_(True)
+            affinity = _gen_affinity_scores(k_detch, src_detch, dest_detch) ## (b, KV_H, N_CTX, N_CTX)
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
         daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
@@ -516,12 +513,8 @@ class _attention(torch.autograd.Function):
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
         ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
         ##   TODO(ahangupta): optimize out into triton kernel later.
-        #dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k_detch, src_detch, dest_detch], grad_outputs=daffinity)
-        #dk += dk_new
-        print(f'point four: {k.requires_grad}')
-        dsrc = torch.empty_like(static_src)
-        ddest = torch.empty_like(static_dest)
-        pdb.set_trace()
+        dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k_detch, src_detch, dest_detch], grad_outputs=daffinity)
+        dk += dk_new
         return dq, dk, dv, None, None, dsrc, ddest, None
     
 attention = _attention.apply

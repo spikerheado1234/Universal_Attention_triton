@@ -174,23 +174,13 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         do = do_torch.clone().detach().requires_grad_(True)
         do = do.transpose(1, 2)
         do = torch.reshape(do, (do.shape[0], do.shape[1] * do.shape[2], do.shape[3], do.shape[4]))
-        k.retain_grad()
-        print(f'point outer: {k.requires_grad}')
         triton_output.backward(do)
-        print(f'point outer-two: {k.requires_grad}')
-        dq, dk, dv, dsrc, ddest = ua_bwd(q, k, v, static_src, static_dest, do)
         print('------custom-------')
         print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(q.grad.shape), torch.nan_to_num(q.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(v.grad.shape), torch.nan_to_num(v.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
         print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
-        print('------sanity-------')
-        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dq.shape), torch.nan_to_num(dq), atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dk.shape), torch.nan_to_num(dk), atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dv.shape), torch.nan_to_num(dv), atol=1e-1, rtol=1e-1)}')
-        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrc.shape), torch.nan_to_num(dsrc), atol=1e-1, rtol=1e-1)}')
-        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddest.shape), torch.nan_to_num(ddest), atol=1e-1, rtol=1e-1)}')
 
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
