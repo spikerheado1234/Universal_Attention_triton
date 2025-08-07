@@ -199,11 +199,11 @@ def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=Fa
     device="cuda" if torch.cuda.is_available() else "cpu"
     #dtype=torch.bfloat16
     dtype=torch.float32
-    q = torch.randn((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    static_src = torch.randn((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
-    static_dest = torch.randn((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    q = torch.rand((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    v = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    static_src = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    static_dest = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
     _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
 
 
