@@ -83,7 +83,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # prepare p and v for the dot
         v_ptr = offsetv_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
         v = tl.load(desc_v + v_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:, None] < N_CTX, other=0.0)
-        p = p.to(dtype)
+        p = p.to(v.dtype.element_ty)
         # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
         # update m_i and l_i
@@ -159,7 +159,7 @@ def _attn_fwd(sm_scale, M,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    tl.store(desc_o+qo_ptr, acc.to(dtype), mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < N_CTX)
+    tl.store(desc_o+qo_ptr, acc.to(desc_o.dtype.element_ty), mask=tl.arange(0, BLOCK_M)[:, None]+start_m*BLOCK_M < N_CTX)
 
 @triton.jit
 def _attn_bwd_preprocess(O, DO,  #
@@ -171,11 +171,11 @@ def _attn_bwd_preprocess(O, DO,  #
     off_hz = tl.program_id(1)
     off_n = tl.arange(0, HEAD_DIM)
     # load
-    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :], mask=off_m[:, None] < N_CTX, other=0.0)
+    o = tl.load(O + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :], mask=off_m[:, None] < N_CTX, other=0.0).to(tl.float32)
     do = tl.load(DO + off_hz * HEAD_DIM * N_CTX + off_m[:, None] * HEAD_DIM + off_n[None, :], mask=off_m[:, None] < N_CTX, other=0.0).to(tl.float32)
     delta = tl.sum(o * do, axis=1)
     # write-back
-    tl.store(Delta + off_hz * N_CTX + off_m, delta, mask=off_m < N_CTX)
+    tl.store(Delta + off_hz * N_CTX + off_m, delta.to(Delta.dtype.element_ty), mask=off_m < N_CTX)
 
 
 # The main inner-loop logic for computing dK and dV.
@@ -272,7 +272,7 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(tl.float16)
+        ds = ds.to(q.dtype.element_ty)
         ## Store to daffinity. ##
         tl.store(daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
         # Compute dQ.
@@ -369,12 +369,12 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         )
 
         dv_ptrs = DV + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-        tl.store(dv_ptrs, dv.to(tl.float16), mask=offs_n[:, None] < N_CTX)
+        tl.store(dv_ptrs, dv.to(dv_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
         # Write back dK.
         dk *= sm_scale
         dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
-        tl.store(dk_ptrs, dk.to(tl.float16), mask=offs_n[:, None] < N_CTX)
+        tl.store(dk_ptrs, dk.to(dk_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
     # THIS BLOCK DOES DQ:
     start_m = pid * BLOCK_M2
@@ -400,7 +400,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
     dq *= sm_scale
-    tl.store(dq_ptrs, dq.to(tl.float16), mask=offs_m[:, None] < N_CTX)
+    tl.store(dq_ptrs, dq.to(dq_ptrs.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
 
 class _attention(torch.autograd.Function):
 
