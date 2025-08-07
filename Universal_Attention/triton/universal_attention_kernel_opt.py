@@ -181,7 +181,7 @@ def _attn_bwd_preprocess(O, DO,  #
 # The main inner-loop logic for computing dK and dV.
 @triton.jit
 def _attn_bwd_dkdv(dk, dv,  #
-                   Q, k, v, sm_scale,  #
+                   Q, k, v, AFFINITY, sm_scale,  #
                    DO,  #
                    M, D,  #
                    # shared by Q/K/V/DO.
@@ -207,7 +207,10 @@ def _attn_bwd_dkdv(dk, dv,  #
             qT = tl.trans(tl.load(qT_ptrs, mask=offs_m[:, None] < N_CTX)) ## (HEAD, BLOCK_M1)
             # Load m before computing qk to reduce pipeline stall.
             m = tl.load(M + offs_m + (q_grp_head * KV_H * N_CTX), mask=offs_m < N_CTX) ## (BLOCK_M1, )
-            qkT = tl.dot(k, qT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32)) ## (BLOCK_N1, BLOCK_M1)
+            affs = tl.trans(
+                tl.load(AFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :], 
+                        mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))).to(tl.float32) ## (BLOCK_N1, BLOCK_M1)
+            qkT = tl.dot(k, qT) + affs ## (BLOCK_N1, BLOCK_M1)
             pT = tl.math.exp(qkT - m[None, :])
             # Autoregressive masking.
             if MASK:
@@ -342,7 +345,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         v = tl.load(V + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d, mask=offs_n[:, None] < N_CTX)
 
         dk, dv = _attn_bwd_dkdv(dk, dv,  #
-                            Q + (stride_h * (bhid % KV_H)).to(tl.int64), k, v, sm_scale,  # Correctly point the necessary KV_H channel.
+                            Q + (stride_h * (bhid % KV_H)).to(tl.int64), k, v, AFFINITY, sm_scale,  # Correctly point the necessary KV_H channel.
                             DO + (stride_h * (bhid % KV_H)).to(tl.int64),  # Correctly point to the necessary KV_H channel.
                             M, D,  #
                             stride_tok, stride_d,  #
@@ -358,7 +361,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         # Compute dK and dV for non-masked blocks.
         dk, dv = _attn_bwd_dkdv(  #
             dk, dv,  #
-            Q + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64), k, v, sm_scale,  #
+            Q + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64), k, v, AFFINITY, sm_scale,  #
             DO + stride_h * (bhid % (Q_H * KV_H)).to(tl.int64),  #
             M, D,  #
             stride_tok, stride_d,  #
