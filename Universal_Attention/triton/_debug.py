@@ -82,11 +82,17 @@ def sdpa_torch_bwd(attn, k, v, q, o, incoming_gradients):
 
 ## Currently untested. TODO(ahangupta): test this function. ##
 def ua_bwd(q, k, v, src, dest, incoming_gradients):
+    assert q.shape[1] % k.shape[1] == 0, 'Incorrect number of heads for gqa passed in.'
+    incoming_query_shape = q.shape
+    q = torch.reshape(q, shape=(q.shape[0], q.shape[1] // k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
+    incoming_gradients = torch.reshape(incoming_gradients, shape=q.shape)
+    qk = torch.einsum('brnqh, bnkh -> brnqk', q, k)
+
     affinity = _gen_affinity_scores(k, src, dest)
-    qk = torch.einsum('bnqh, bnkh -> bnqk', q, k)
-    qk += affinity
+    qk += affinity.unsqueeze(1)
     attn = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
-    o = torch.einsum('bnqk, bnkh -> bnqh', attn.to(dtype=q.dtype), v)
+    attn = attn.to(q.dtype)
+    o = torch.einsum('brnqk, bnkh -> brnqh', attn.to(dtype=q.dtype), v)
 
     ## Now, we compute the gradients. ##
 
@@ -94,21 +100,21 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dv = torch.einsum('brnqk, brnqh -> bnkh', attn, incoming_gradients)
 
     ## dq/dk. ##
-    dattn = torch.einsum('bnqh, bnkh -> bnqk', incoming_gradients, v)
+    dattn = torch.einsum('brnqh, bnkh -> brnqk', incoming_gradients, v)
     d = torch.sum(incoming_gradients * o, axis=-1)  ## (b, n, s) -> Similar sized shape to logsumexp.
     dp = (attn * dattn) - (torch.unsqueeze(d, dim=-1) * attn) 
-    dq = torch.einsum('bnqk, bnkt -> bnqt', dp, k) 
-    dk = torch.einsum('bnkq, bnkt -> bnqt', dp, q)
+    dq = torch.einsum('brnqk, bnkt -> brnqt', dp, k) 
+    dk = torch.einsum('brnkq, brnkt -> bnqt', dp, q)
 
     ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
-    affinity.backward(torch.sum(torch.reshape(dp, (dp.shape[0], dp.shape[1] // k.shape[1], k.shape[1], dp.shape[2], dp.shape[3])), dim=1))
+    affinity.backward(dp.sum(1, keepdim=False))
     dk += k.grad
     dsrc = src.grad
     ddest = dest.grad
 
     k.grad, src.grad, dest.grad = None, None, None
 
-    return dq, dk, dv, dsrc, ddest
+    return dq.transpose(1, 2), dk, dv, dsrc, ddest
 
 
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
@@ -156,17 +162,25 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
     triton_output = fn()
-    do = torch.randn_like(q).to(q.device)
+    do_torch = torch.randn_like(torch_output).to(q.device)
     print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
     if backward:
-        torch_output.backward(do)
+        q_torch.retain_grad()
+        k_torch.retain_grad()
+        v_torch.retain_grad()
+        static_src_torch.retain_grad()
+        static_dest_torch.retain_grad()
+        torch_output.backward(do_torch) ## (b,h,r,l,d)
+        do = do_torch.clone().detach().requires_grad_(True)
+        do = do.transpose(1, 2)
+        do = torch.reshape(do, (do.shape[0], do.shape[1] * do.shape[2], do.shape[3], do.shape[4]))
         dq, dk, dv, dsrc, ddest = ua_bwd(q, k, v, static_src, static_dest, do)
         print('------sanity-------')
-        print(f'dq allclose: {torch.allclose(q_torch.grad, dq.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(k_torch.grad, dk.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose: {torch.allclose(v_torch.grad, dv.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'dsrc allclose: {torch.allclose(static_src_torch.grad, dsrc.grad, atol=1e-1, rtol=1e-1)}')
-        print(f'ddest allclose: {torch.allclose(static_dest_torch.grad, ddest.grad, atol=1e-1, rtol=1e-1)}')
+        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dq.shape), torch.nan_to_num(dq), atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dk.shape), torch.nan_to_num(dk), atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dv.shape), torch.nan_to_num(dv), atol=1e-1, rtol=1e-1)}')
+        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrc.shape), torch.nan_to_num(dsrc), atol=1e-1, rtol=1e-1)}')
+        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddest.shape), torch.nan_to_num(ddest), atol=1e-1, rtol=1e-1)}')
 
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
@@ -207,15 +221,16 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
-    test_case_universal_attention(1, 1, 1, 16, 16, backward=False)
-    test_case_universal_attention(1, 1, 1, 32, 16, backward=False)
-    test_case_universal_attention(1, 1, 1, 256, 128, backward=False)
-    test_case_universal_attention(1, 1, 1, 1024, 128, backward=False)
-    test_case_universal_attention(6, 1, 1, 1024, 128, backward=False)
-    test_case_universal_attention(6, 1, 4, 1024, 128, backward=False)
-    test_case_universal_attention(6, 2, 4, 1024, 128, backward=False)
+    #test_case_universal_attention(1, 1, 1, 16, 16, backward=False)
+    #test_case_universal_attention(1, 1, 1, 32, 16, backward=False)
+    #test_case_universal_attention(1, 1, 1, 256, 128, backward=False)
+    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=False)
+    #test_case_universal_attention(6, 1, 1, 1024, 128, backward=False)
+    #test_case_universal_attention(6, 1, 4, 1024, 128, backward=False)
+    #test_case_universal_attention(6, 2, 4, 1024, 128, backward=False)
+    #test_case_universal_attention(1, 2, 4, 16, 16, backward=False) ## For debugging only test case that is failing at the moment.
     test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
-    #test_case_universal_attention(1, 2, 4, 16, 16, backward=False)
+    test_case_universal_attention(6, 2, 4, 1024, 128, backward=True)
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
    # test_case(1, 2, 4, 16, 16, backward=False)
