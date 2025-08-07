@@ -83,7 +83,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         # prepare p and v for the dot
         v_ptr = offsetv_y + tl.arange(0, BLOCK_N)[:, None]*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
         v = tl.load(desc_v + v_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:, None] < N_CTX, other=0.0)
-        p = p.to(v.dtype.element_ty)
+        p = p.to(desc_v.dtype.element_ty)
         # note that this non transposed v for FP8 is only supported on Blackwell
         acc = tl.dot(p, v, acc)
         # update m_i and l_i
@@ -272,7 +272,7 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         # Compute dP and dS.
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
-        ds = ds.to(q.dtype.element_ty)
+        ds = ds.to(K.dtype.element_ty)
         ## Store to daffinity. ##
         tl.store(daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
         # Compute dQ.
