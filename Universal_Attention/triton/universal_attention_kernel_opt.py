@@ -95,10 +95,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offseta_y += BLOCK_N
     return acc, l_i, m_i
 
-@triton.autotune(
-        configs=get_cuda_configs(),
-        key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
-        )
+#@triton.autotune(
+#        configs=get_cuda_configs(),
+#        key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
+#        )
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, desc_affinity,
@@ -429,15 +429,13 @@ class _attention(torch.autograd.Function):
         desc_k = k
         desc_o = o
 
-        def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
-
         ## Here, we launch an affinity matrix calculation kernel to simplify implementation. ##
         desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
 
-        #BLOCK_M=16
-        #BLOCK_N=16
-        #grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+        ## Specialize to this blk size for reasonable performance. ##
+        BLOCK_M=128
+        BLOCK_N=64
+        grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
         _attn_fwd[grid](
@@ -446,14 +444,16 @@ class _attention(torch.autograd.Function):
             desc_q, desc_k, desc_v, desc_o, desc_affinity,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
-            #BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
-            #BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
+            BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
+            BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
             FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             causal=causal,
             KV_H=KV_H,
             Q_H=Q_H,
+            num_warps=8,
+            num_stages=2,
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M, static_src, static_dest)
