@@ -233,8 +233,8 @@ def _attn_bwd_dkdv(dk, dv,  #
 
 # the main inner-loop logic for computing dQ
 @triton.jit
-def _attn_bwd_dq(dq, q, K, V,  #
-                 do, m, D,
+def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
+                 do, DAFFINITY, m, D,
                  # shared by Q/K/V/DO.
                  stride_tok, stride_d,  #
                  H, N_CTX,  #
@@ -249,6 +249,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
     offs_k = tl.arange(0, HEAD_DIM)
     kT_ptrs = K + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
     vT_ptrs = V + offs_n[None, :] * stride_tok + offs_k[:, None] * stride_d
+    affinity_ptrs = AFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
+    daffinity_ptrs = DAFFINITY + offs_m[:, None] * N_CTX + offs_n[None, :]
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(D + offs_m, mask=offs_m < N_CTX, other=0.0)
     # BLOCK_M2 must be a multiple of BLOCK_N2, otherwise the code wouldn't work.
@@ -259,7 +261,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
         kT = tl.load(kT_ptrs, mask=offs_n[None, :] < N_CTX)
         vT = tl.load(vT_ptrs, mask=offs_n[None, :] < N_CTX)
-        qk = tl.dot(q, kT) / tl.sqrt(tl.cast(HEAD_DIM, tl.float32))
+        affs = tl.load(affinity_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX), other=0.0) # (BLOCK_M2, BLOCK_N2)
+        qk = tl.dot(q, kT) + affs ## (BLOCK_M2, BLOCK_N2)
         p = tl.math.exp(qk - m)
         # Autoregressive masking.
         if MASK:
@@ -270,6 +273,8 @@ def _attn_bwd_dq(dq, q, K, V,  #
         dp = tl.dot(do, vT).to(tl.float32)
         ds = p * (dp - Di[:, None])
         ds = ds.to(tl.float16)
+        ## Store to daffinity. ##
+        tl.store(daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -282,7 +287,7 @@ def _attn_bwd_dq(dq, q, K, V,  #
 @triton.jit
 def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
               DO,  #
-              DQ, DK, DV,  #
+              DQ, DK, DV, DAFFINITY,  #
               M, D,
               # shared by Q/K/V/DO.
               stride_z, stride_h, stride_tok, stride_d,  #
@@ -308,6 +313,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     DK += adj_KV
     DV += adj_KV
     AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    DAFFINITY += ((bhid // (KV_H * Q_H)) * ((Q_H * KV_H) * N_CTX * N_CTX) + (bhid % (KV_H * Q_H)) * (N_CTX * N_CTX)).to(tl.int64)
     ## Adjust these to batch dimension only since we need to loop through the "r" dimension for GQA. ##
     Q += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
     DO += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
@@ -384,21 +390,12 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     # The highest key index this query block can see is limited by N_CTX.
     effective_end_n = tl.minimum(start_m + BLOCK_M2, N_CTX)
     
-    if causal:
-        # We start from key 0 and go up to the diagonal.
-        num_steps = tl.cdiv(effective_end_n, BLOCK_N2)
-        dq = _attn_bwd_dq(
-            dq, q, K, V, do, m, D,
-            stride_tok, stride_d, Q_H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
-            start_m, 0, num_steps, MASK=True
-        )
-    else: # Non-causal
-        num_steps = tl.cdiv(N_CTX, BLOCK_N2)
-        dq = _attn_bwd_dq(
-            dq, q, K, V, do, m, D,
-            stride_tok, stride_d, Q_H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
-            start_m, 0, num_steps, MASK=False
-        )
+    num_steps = tl.cdiv(effective_end_n, BLOCK_N2)
+    dq = _attn_bwd_dq(
+        dq, q, K, V, AFFINITY, do, DAFFINITY, m, D,
+        stride_tok, stride_d, Q_H, N_CTX, BLOCK_M2, BLOCK_N2, HEAD_DIM,
+        start_m, 0, num_steps, MASK=True
+    )
 
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
@@ -408,7 +405,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, universal=False, static_src=None, static_dest=None, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, static_src=None, static_dest=None, warp_specialize=True):
         assert causal, 'currently, only support causal-autoregressive style generation only.'
         assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
         # shape constraints
@@ -489,13 +486,14 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
         ## Recompute affinity scores. ##
-        affinity = _gen_affinity_scores(k, static_src, static_dest)
+        affinity = _gen_affinity_scores(k, static_src, static_dest) ## (b, KV_H, N_CTX, N_CTX)
+        daffinity = torch.zeros_like(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
         _attn_bwd[grid](
-            q, k, v, affinity, scale, do, dq, dk, dv,  #
+            q, k, v, affinity, scale, do, dq, dk, dv, daffinity,  #
             M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             Q_H, KV_H, N_CTX,  #
@@ -507,55 +505,14 @@ class _attention(torch.autograd.Function):
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
         )
-
-        ## TODO(ahangupta): adjust to computing dsrc & ddest.
-        return dq, dk, dv, None, None, None, None, None, None, None
+        daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
+        ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
+        ##   TODO(ahangupta): optimize out into triton kernel later.
+        affinity.backward(daffinity)
+        dsrc = static_src.grad
+        ddest = static_dest.grad
+        dk += k.grad
+        static_src.grad, static_dest.grad, k.grad = None, None, None
+        return dq, dk, dv, None, None, dsrc, ddest, None
     
 attention = _attention.apply
-
-
-## We run a simple correctness test here. ##
-if __name__ == '__main__':
-
-    dtype = torch.float16
-    mode="bwd"
-    BATCH=2
-    H=2
-    N_CTX=16
-    HEAD_DIM=32
-    device="cuda" if torch.cuda.is_available() else "cpu"
-    provider = "triton" ## triton/flash.
-    q = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    v = torch.randn((BATCH, H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    q_torch = q.clone().detach().requires_grad_(True)
-    k_torch = k.clone().detach().requires_grad_(True)
-    v_torch = v.clone().detach().requires_grad_(True)
-    sm_scale = 1.3
-    causal = True
-    fn = lambda: attention(q, k, v, causal, sm_scale)
-    if mode == "bwd":
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-
-    triton_output = fn()
-
-    fn = lambda: scaled_dot_product_attention(q_torch,k_torch,v_torch, is_causal=causal)
-
-    if mode == "bwd":
-        o = fn()
-        do = torch.randn_like(o)
-        fn = lambda: o.backward(do, retain_graph=True)
-
-    true_output = fn()
-
-    if mode != "bwd":
-        print(f'delta is: {torch.allclose(triton_output, true_output, rtol=1e-1, atol=1e-1)}')
-
-    if mode == "bwd":
-        print(f'q_torch.grad: {q_torch.grad}')
-        print(f'q.grad: {q.grad}')
-        print(f'dq delta is: {torch.allclose(q_torch.grad, q.grad, rtol=1, atol=1)}')
-        print(f'dk delta is: {torch.allclose(k_torch.grad, k.grad, rtol=1, atol=1)}')
-        print(f'dv delta is: {torch.allclose(v_torch.grad, v.grad, rtol=1, atol=1)}')
