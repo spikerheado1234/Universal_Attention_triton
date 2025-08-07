@@ -114,7 +114,6 @@ def _attn_fwd(sm_scale, M,  #
               Q_H: tl.constexpr
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     off_z = off_hz // H

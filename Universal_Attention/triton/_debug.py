@@ -319,7 +319,7 @@ if __name__ == '__main__':
     test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
     test_case_universal_attention(6, 1, 4, 1024, 128, backward=True) 
     speed_test_ua(6, 1, 4, 1024, 128, backward=True) 
-    speed_test_ua(6, 1, 32, 4096, 128, backward=True) 
+    speed_test_ua(1, 1, 32, 4096, 128, backward=True) 
     #test_case_universal_attention(6, 2, 4, 1024, 128, backward=True) 
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
