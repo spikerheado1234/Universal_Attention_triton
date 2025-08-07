@@ -160,7 +160,7 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
     torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale, True, static_src, static_dest)
+    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
     triton_output = fn()
     do_torch = torch.randn_like(torch_output).to(q.device)
     print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')

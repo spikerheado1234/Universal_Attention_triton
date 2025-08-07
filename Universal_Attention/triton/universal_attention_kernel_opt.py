@@ -486,12 +486,16 @@ class _attention(torch.autograd.Function):
             BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
         )
         ## Recompute affinity scores. ##
+        ## Turn on autodiff for this. ##
+        k.requires_grad_(True)
+        static_src.requires_grad_(True)
+        static_dest.requires_grad_(True)
         affinity = _gen_affinity_scores(k, static_src, static_dest) ## (b, KV_H, N_CTX, N_CTX)
-        daffinity = torch.zeros_like(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
-        grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
-        scale = 1.0 / ctx.HEAD_DIM**0.5
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
+        daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
+        grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
+        scale = 1.0 / ctx.HEAD_DIM**0.5
         _attn_bwd[grid](
             q, k, v, affinity, scale, do, dq, dk, dv, daffinity,  #
             M, delta,  #
