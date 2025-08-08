@@ -108,6 +108,7 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dk = torch.einsum('brnkq, brnkt -> bnqt', dp, q)
 
     ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
+    #print(f'torch-dp-sum: {dp.sum()}')
     dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
     dk += dkt
 

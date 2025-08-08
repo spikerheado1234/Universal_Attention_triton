@@ -502,6 +502,8 @@ class _attention(torch.autograd.Function):
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
         )
+        #print(f'triton daffinity: {daffinity}')
+        #print(f'triton dp sum: {daffinity.sum()}')
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
         ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
         ##   TODO(ahangupta): optimize out into triton kernel later.
