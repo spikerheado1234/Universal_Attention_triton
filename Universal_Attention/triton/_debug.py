@@ -108,12 +108,10 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dk = torch.einsum('brnkq, brnkt -> bnqt', dp, q)
 
     ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
-    affinity.backward(dp.sum(1, keepdim=False))
-    dk += k.grad
-    dsrc = src.grad
-    ddest = dest.grad
-
-    k.grad, src.grad, dest.grad = None, None, None
+    dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
+    dk += dkt
+    dsrc = src
+    ddest = dest
 
     return dq.transpose(1, 2), dk, dv, dsrc, ddest
 
@@ -182,6 +180,13 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(k.grad), atol=1, rtol=1)}')
         print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(static_src.grad), atol=1, rtol=1)}')
         print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
+        print('-----sanity-------')
+        dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
+        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(dqc), atol=1, rtol=1)}')
+        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(dvc), atol=1, rtol=1)}')
+        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(dkc), atol=1, rtol=1)}')
+        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(dsrcc), atol=1, rtol=1)}')
+        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(ddestc), atol=1, rtol=1)}')
 
 def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
