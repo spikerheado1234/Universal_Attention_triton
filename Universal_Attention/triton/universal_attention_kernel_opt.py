@@ -404,7 +404,8 @@ class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale, static_src=None, static_dest=None, warp_specialize=True):
         assert causal, 'currently, only support causal-autoregressive style generation only.'
-        assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
+        #assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
+        assert q.shape[2] % 128 == 0, 'Only works for multiples of 128!'
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
@@ -502,9 +503,8 @@ class _attention(torch.autograd.Function):
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
         )
-        #print(f'triton daffinity: {daffinity}')
-        #print(f'triton dp sum: {daffinity.sum()}')
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
+        #daffinity = daffinity.transpose(-1, -2).contiguous()
         ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
         ##   TODO(ahangupta): optimize out into triton kernel later.
         dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)

@@ -108,7 +108,6 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dk = torch.einsum('brnkq, brnkt -> bnqt', dp, q)
 
     ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
-    #print(f'torch-dp-sum: {dp.sum()}')
     dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
     dk += dkt
 
@@ -181,6 +180,11 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
         print('-----sanity-------')
         dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
+        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1, rtol=1)}')
+        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1, rtol=1)}')
+        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1, rtol=1)}')
+        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1, rtol=1)}')
+        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
         print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(dqc), atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(dvc), atol=1, rtol=1)}')
         print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(dkc), atol=1, rtol=1)}')
@@ -320,8 +324,15 @@ if __name__ == '__main__':
     #test_case_universal_attention(6, 1, 4, 1024, 128, backward=False)
     #test_case_universal_attention(6, 2, 4, 1024, 128, backward=False)
     #test_case_universal_attention(1, 2, 4, 16, 16, backward=False) ## For debugging only, test case that is failing at the moment.
-    test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
-    test_case_universal_attention(6, 1, 4, 1024, 128, backward=True) 
+    #test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
+    #test_case_universal_attention(1, 1, 1, 32, 32, backward=True)
+    #test_case_universal_attention(1, 1, 1, 64, 64, backward=True)
+    #test_case_universal_attention(1, 1, 1, 96, 64, backward=True)
+    #test_case_universal_attention(1, 1, 1, 80, 64, backward=True)
+    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
+    #test_case_universal_attention(6, 1, 4, 1024, 128, backward=True) 
     #speed_test_ua(6, 1, 4, 1024, 128, backward=True) 
     #speed_test_ua(1, 1, 32, 2048, 128, backward=True) 
     #test_case_universal_attention(6, 2, 4, 1024, 128, backward=True) 
