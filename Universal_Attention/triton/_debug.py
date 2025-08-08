@@ -110,8 +110,6 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     ## dsrc, ddest and last part of dk. ## -> Just call pytorch autograd for this.
     dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
     dk += dkt
-    dsrc = src
-    ddest = dest
 
     return dq.transpose(1, 2), dk, dv, dsrc, ddest
 
