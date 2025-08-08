@@ -182,6 +182,13 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
         print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
+        print('-----sanity-------')
+        dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q_torch, k_torch, v_torch, static_src_torch, static_dest_torch, do)
+        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(q.grad.shape), torch.nan_to_num(dqc), atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(v.grad.shape), torch.nan_to_num(dvc), atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(dkc), atol=1e-1, rtol=1e-1)}')
+        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(dsrcc), atol=1e-1, rtol=1e-1)}')
+        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(ddestc), atol=1e-1, rtol=1e-1)}')
 
 def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
