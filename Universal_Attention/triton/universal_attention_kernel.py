@@ -926,6 +926,7 @@ def universal_attention_forward(kc, vc, xq, static_src, static_dest):
             #print(f'score-torch: {score.sum()}')
             _denom_ = score.logsumexp(dim=-2)  # b h r _c
             _out_ = score.transpose(-1,-2).softmax(dim=-1).to(dtype=_q.dtype).matmul(v_.unsqueeze(2))  # b h r _c d
+            #print(f'torch-attn: {_out_.sum()}')
 
             out[:,:,:,j*_c:(j+1)*_c,:,i] = _out_
             denom[:,:,:,j*_c:(j+1)*_c,i] = _denom_
