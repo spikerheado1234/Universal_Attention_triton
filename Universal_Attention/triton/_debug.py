@@ -293,8 +293,7 @@ def speed_test_ua(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=True):
     print(f'--------SPEED-TEST BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
     causal = True
     device="cuda" if torch.cuda.is_available() else "cpu"
-    #dtype=torch.bfloat16
-    dtype=torch.float32
+    dtype=torch.bfloat16
     q = torch.rand((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
     v = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
@@ -330,12 +329,13 @@ if __name__ == '__main__':
     #test_case_universal_attention(1, 1, 1, 64, 64, backward=True)
     #test_case_universal_attention(1, 1, 1, 96, 64, backward=True)
     #test_case_universal_attention(1, 1, 1, 80, 64, backward=True)
-    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
     #test_case_universal_attention(6, 1, 4, 1024, 128, backward=True) 
     #speed_test_ua(6, 1, 4, 1024, 128, backward=True) 
-    #speed_test_ua(1, 1, 32, 2048, 128, backward=True) 
+    speed_test_ua(1, 1, 32, 2048, 128, backward=True) 
+    speed_test_ua(1, 1, 32, 1024, 128, backward=True) 
     #test_case_universal_attention(6, 2, 4, 1024, 128, backward=True) 
 
     ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
