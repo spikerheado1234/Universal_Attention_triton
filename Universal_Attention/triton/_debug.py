@@ -88,6 +88,7 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     q = torch.reshape(q, shape=(q.shape[0], q.shape[1] // k.shape[1], k.shape[1], q.shape[2], q.shape[3]))
     incoming_gradients = torch.reshape(incoming_gradients, shape=q.shape)
     qk = torch.einsum('brnqh, bnkh -> brnqk', q, k)
+    qk += torch.triu(torch.full(qk.shape, -1e6), diagonal=1).to(qk.device)
 
     affinity = _gen_affinity_scores(k, src, dest)
     qk += affinity.unsqueeze(1)

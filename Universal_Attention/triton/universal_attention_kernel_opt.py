@@ -263,7 +263,7 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         p = tl.math.exp(qk - m)
         # Autoregressive masking.
         if MASK:
-            offs_n = curr_n + tl.arange(0, BLOCK_N2)
+            #offs_n = curr_n + tl.arange(0, BLOCK_N2)
             mask = (offs_m[:, None] >= offs_n[None, :]) & (offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX)
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
