@@ -369,7 +369,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
         tl.store(dv_ptrs, dv.to(dv_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
         # Write back dK.
-        dk *= sm_scale
+        #dk *= sm_scale
         dk_ptrs = DK + offs_n[:, None] * stride_tok + offs_k[None, :] * stride_d
         tl.store(dk_ptrs, dk.to(dk_ptrs.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
 
@@ -396,7 +396,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 
     # Write back dQ.
     dq_ptrs = DQ + offs_m[:, None] * stride_tok + offs_k[None, :] * stride_d
-    dq *= sm_scale
+    #dq *= sm_scale
     tl.store(dq_ptrs, dq.to(dq_ptrs.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
 
 class _attention(torch.autograd.Function):
@@ -504,7 +504,7 @@ class _attention(torch.autograd.Function):
             num_stages=NUM_STAGES  #
         )
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
-        #daffinity = daffinity.transpose(-1, -2).contiguous()
+        daffinity = daffinity.transpose(-1, -2).contiguous()
         ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
         ##   TODO(ahangupta): optimize out into triton kernel later.
         dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
