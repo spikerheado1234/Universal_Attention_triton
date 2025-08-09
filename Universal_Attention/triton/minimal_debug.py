@@ -1,5 +1,6 @@
 import torch
 import sys
+sys.path.append('.')
 
 from universal_attention_kernel_opt import attention, _gen_affinity_scores
 from _debug import ua_bwd
@@ -61,6 +62,7 @@ def minimal_debug_test():
             # Print some sample values for debugging
             print(f"Triton dk[0,0,0:5,0]: {k_triton.grad[0,0,0:5,0]}")
             print(f"Reference dk[0,0,0:5,0]: {dk_ref[0,0,0:5,0]}")
+            print(f"Ratio (Triton/Ref): {(k_triton.grad[0,0,0:5,0] / dk_ref[0,0,0:5,0])}")
         else:
             print("PASSED: dk gradients match!")
 
