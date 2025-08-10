@@ -266,6 +266,8 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'triton-ua-fwd: {fwd_triton_end-fwd_triton_start}')
         print(f'torch-ua-bwd: {torch_ua_bwd_end-torch_ua_bwd_start}')
         print(f'triton-ua-bwd: {triton_ua_bwd_end-triton_ua_bwd_start}')
+        print(f'torch-fwd+bwd-ua: {(fwd_ua_end-fwd_ua_start)+(torch_ua_bwd_end-torch_ua_bwd_start)}')
+        print(f'triton-fwd+bwd-ua: {(fwd_triton_end-fwd_triton_start)+(triton_ua_bwd_end-triton_ua_bwd_start)}')
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
@@ -323,11 +325,12 @@ if __name__ == '__main__':
     #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
-    test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
-    test_case_universal_attention(2, 1, 32, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
+    ## This seems to be the only faulty test case. ##
+    #test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
-    #speed_test_ua(6, 1, 4, 1024, 128, backward=True) 
-    #speed_test_ua(1, 1, 32, 2048, 128, backward=True) 
-    #speed_test_ua(1, 1, 32, 1024, 128, backward=True) 
-    #test_case_universal_attention(6, 2, 4, 1024, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 256, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 512, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
