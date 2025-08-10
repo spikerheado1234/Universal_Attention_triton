@@ -261,9 +261,7 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         affs = tl.load(affinity_ptrs, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX), other=0.0) # (BLOCK_M2, BLOCK_N2)
         qk = tl.dot(q, kT) + affs ## (BLOCK_M2, BLOCK_N2)
         p = tl.math.exp(qk - m)
-        # Autoregressive masking.
         if MASK:
-            #offs_n = curr_n + tl.arange(0, BLOCK_N2)
             mask = (offs_m[:, None] >= offs_n[None, :]) & (offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX)
             p = tl.where(mask, p, 0.0)
         # Compute dP and dS.
@@ -279,6 +277,8 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         curr_n += step_n
         kT_ptrs += step_n * stride_tok
         vT_ptrs += step_n * stride_tok
+        affinity_ptrs += step_n  # Update affinity pointer to next block
+        daffinity_ptrs += step_n  # Update daffinity pointer to next block
     return dq
 
 @triton.jit
@@ -488,6 +488,7 @@ class _attention(torch.autograd.Function):
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
         daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
+        
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         _attn_bwd[grid](
@@ -503,8 +504,9 @@ class _attention(torch.autograd.Function):
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
         )
+        
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
-        daffinity = daffinity.transpose(-1, -2).contiguous()
+        
         ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
         ##   TODO(ahangupta): optimize out into triton kernel later.
         dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
