@@ -112,7 +112,8 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
     dk += dkt
 
-    return dq.transpose(1, 2), dk, dv, dsrc, ddest
+    #return dq.transpose(1, 2), dk, dv, dsrc, ddest
+    return torch.reshape(dq, incoming_query_shape), dk, dv, dsrc, ddest
 
 
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
@@ -316,48 +317,17 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
-    #test_case_universal_attention(1, 1, 1, 16, 16, backward=False)
-    #test_case_universal_attention(1, 1, 1, 32, 16, backward=False)
-    #test_case_universal_attention(1, 1, 1, 256, 128, backward=False)
-    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=False)
-    #test_case_universal_attention(6, 1, 1, 1024, 128, backward=False)
-    #test_case_universal_attention(6, 1, 4, 1024, 128, backward=False)
-    #test_case_universal_attention(6, 2, 4, 1024, 128, backward=False)
-    #test_case_universal_attention(1, 2, 4, 16, 16, backward=False) ## For debugging only, test case that is failing at the moment.
-    #test_case_universal_attention(1, 1, 1, 16, 16, backward=True)
-    #test_case_universal_attention(1, 1, 1, 32, 32, backward=True)
-    #test_case_universal_attention(1, 1, 1, 64, 64, backward=True)
-    #test_case_universal_attention(1, 1, 1, 96, 64, backward=True)
-    #test_case_universal_attention(1, 1, 1, 80, 64, backward=True)
-    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
-    #test_case_universal_attention(6, 1, 4, 1024, 128, backward=True) 
+    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
+    test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
+    test_case_universal_attention(2, 1, 32, 2048, 128, backward=True)
+    
+    ## SPEED TESTS TO ASSESS PERFORMANCE ##
     #speed_test_ua(6, 1, 4, 1024, 128, backward=True) 
     #speed_test_ua(1, 1, 32, 2048, 128, backward=True) 
     #speed_test_ua(1, 1, 32, 1024, 128, backward=True) 
     #test_case_universal_attention(6, 2, 4, 1024, 128, backward=True) 
-
-    ## This tests GQA implementation as we incrementally built from there.. Deprecated now...##
-   # test_case(1, 2, 4, 16, 16, backward=False)
-   # #test_case(1, 2, 4, 17, 16, backward=False)
-   # test_case(32, 2, 4, 16, 16, backward=False)
-   # test_case(2, 2, 4, 32, 128, backward=False)
-   # test_case(2, 2, 4, 128, 128, backward=False)
-   # test_case(1, 2, 4, 1024, 16, backward=False)
-   # #test_case(1, 2, 4, 1300, 16, backward=False)
-   # test_case(32, 2, 4, 1024, 16, backward=False)
-   # test_case(32, 2, 4, 1024, 128, backward=False)
-   # test_case(2, 8, 4, 4096, 128, backward=False)
-   # test_case(2, 1, 32, 4096, 128, backward=False)
-   # test_case(1, 2, 4, 16, 16, backward=True)
-   # test_case(1, 2, 4, 32, 16, backward=True)
-   # test_case(1, 2, 4, 1024, 128, backward=True)
-   # #test_case(1, 2, 4, 1300, 16, backward=True)
-   # test_case(32, 2, 4, 16, 16, backward=True)
-   # test_case(32, 2, 4, 1024, 16, backward=True)
-   # test_case(32, 2, 4, 1024, 128, backward=True)
-   # test_case(2, 8, 4, 4096, 128, backward=True)
-   # test_case(2, 1, 32, 4096, 128, backward=True)
