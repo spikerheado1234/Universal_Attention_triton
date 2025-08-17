@@ -162,7 +162,7 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
     triton_output = fn()
     do_torch = torch.randn_like(torch_output).to(q.device)
-    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
+    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-2, rtol=1e-2)}')
     if backward:
         q_torch.retain_grad()
         k_torch.retain_grad()
@@ -182,11 +182,11 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
         print('-----sanity-------')
         dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
-        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1, rtol=1)}')
-        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1, rtol=1)}')
-        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1, rtol=1)}')
-        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1, rtol=1)}')
-        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
+        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1e-1, rtol=1e-1)}')
+        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
+        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
+        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
         #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(dqc), atol=1, rtol=1)}')
         #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(dvc), atol=1, rtol=1)}')
         #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(dkc), atol=1, rtol=1)}')
@@ -286,10 +286,14 @@ def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=Fa
     #dtype=torch.float32
     dtype=torch.bfloat16
     q = torch.rand((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device) 
+    k /= k.pow(2).sum(-1, True).sqrt().add(1e-6)
+    k.requires_grad_(True)
     v = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
-    static_src = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
-    static_dest = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device, requires_grad=True)
+    static_src = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device).sigmoid()
+    static_src.requires_grad_(True)
+    static_dest = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device).sigmoid()
+    static_dest.requires_grad_(True)
     _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
 
 def speed_test_ua(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=True):
@@ -319,18 +323,29 @@ if __name__ == '__main__':
     ##  3. KV_H -> Number of KV_head groups.
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
-    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
-    #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
-    #test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
-    #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
-    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
-    #test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
-    #test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
-    ## This seems to be the only faulty test case. ##
-    #test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
+    ## All TCs passing. ##
+    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
+    test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
+    test_case_universal_attention(1, 1, 32, 2048, 128, backward=True)
+    test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
+    
+    ## Longer sequence tests, need to reduce number of heads for this. ##
+    #test_case_universal_attention(1, 1, 16, 4096, 128, backward=True) 
+    #test_case_universal_attention(2, 1, 8, 4096, 128, backward=True) 
+
+    ## Now, some grouped query attention tests as well. ##
+    #test_case_universal_attention(1, 2, 4, 128, 128, backward=True)
+    #test_case_universal_attention(1, 2, 8, 512, 128, backward=True)
+    #test_case_universal_attention(1, 2, 16, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
-    speed_test_ua(2, 1, 32, 256, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 512, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 512, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
