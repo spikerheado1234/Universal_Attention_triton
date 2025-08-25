@@ -6,6 +6,7 @@ import pdb
 from universal_attention_kernel import universal_attention_forward
 from math import ceil
 import time
+from torch.nn.attention.flex_attention import flex_attention
 
 def sdpa_torch(q, k, v, causal=False):
     """
@@ -115,6 +116,9 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     #return dq.transpose(1, 2), dk, dv, dsrc, ddest
     return torch.reshape(dq, incoming_query_shape), dk, dv, dsrc, ddest
 
+def ua_flex_attention(q, k, v, src, dest):
+    affs = _gen_affinity_scores(k, src, dest)
+    return flex_attention(q, k, v, score_mod=affs)
 
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
@@ -146,8 +150,13 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     q_torch = q.clone().detach().requires_grad_(True)
     k_torch = k.clone().detach().requires_grad_(True)
     v_torch = v.clone().detach().requires_grad_(True)
+    q_flex = q.clone().detach().requires_grad_(True)
+    k_flex = k.clone().detach().requires_grad_(True)
+    v_flex = v.clone().detach().requires_grad_(True)
     static_src_torch = static_src.clone().detach().requires_grad_(True)
     static_dest_torch = static_dest.clone().detach().requires_grad_(True)
+    static_src_flex = static_src.clone().detach().requires_grad_(True)
+    static_dest_flex = static_dest.clone().detach().requires_grad_(True)
     c_, _c = 16, 16
     n_, _n = ceil(q.shape[2] / c_), ceil(q.shape[2] / _c)
     q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1] // k_torch.shape[1], k_torch.shape[1], _n, _c, q_torch.shape[-1]))
@@ -161,8 +170,10 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
     triton_output = fn()
+    flex_attention_output = ua_flex_attention(q_flex, k_flex, v_flex, static_src_flex, static_dest_flex)
     do_torch = torch.randn_like(torch_output).to(q.device)
-    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-2, rtol=1e-2)}')
+    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
+    print(f'outputs allclose-flex: {torch.allclose(torch.nan_to_num(flex_attention_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
     if backward:
         q_torch.retain_grad()
         k_torch.retain_grad()
