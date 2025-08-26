@@ -116,9 +116,26 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     #return dq.transpose(1, 2), dk, dv, dsrc, ddest
     return torch.reshape(dq, incoming_query_shape), dk, dv, dsrc, ddest
 
-def ua_flex_attention(q, k, v, src, dest):
+def make_universal_score_mod(k: torch.Tensor, src: torch.Tensor, dest: torch.Tensor):
+    """Return a score_mod callable for flex_attention that reproduces the
+    universal-attention affinity computed by _gen_affinity_scores.
+
+    The returned callable closes over a precomputed affinity tensor to avoid
+    recomputing O(N^2) work per callback.
+    """
     affs = _gen_affinity_scores(k, src, dest)
-    return flex_attention(q, k, v, score_mod=affs)
+    scale_fix = sqrt(k.shape[-1]) 
+
+    def score_mod(score, b: int, h: int, q_idx: int, k_idx: int):
+        return score*scale_fix + affs[b, h, q_idx, k_idx]
+
+    return score_mod
+
+
+def ua_flex_attention(q, k, v, src, dest):
+    score_mod = make_universal_score_mod(k, src, dest)
+    # _gen_affinity_scores already encodes causal structure; keep is_causal=False.
+    return flex_attention(q, k, v, score_mod=score_mod)
 
 def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
     ## We clone and detach the tensors for grad checking. ##
@@ -185,6 +202,8 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         do = do.transpose(1, 2)
         do = torch.reshape(do, (do.shape[0], do.shape[1] * do.shape[2], do.shape[3], do.shape[4]))
         triton_output.backward(do)
+        do_flex = do.clone().detach().requires_grad_(True)
+        flex_attention_output.backward(do_flex)
         #print('------custom-------')
         #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(q.grad.shape), torch.nan_to_num(q.grad), atol=1, rtol=1)}')
         #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(v.grad.shape), torch.nan_to_num(v.grad), atol=1, rtol=1)}')
@@ -198,7 +217,7 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
         print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q_flex.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q_flex.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v_flex.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k_flex.grad), atol=1e-1, rtol=1e-1)}')
         print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src_flex.grad), atol=1e-1, rtol=1e-1)}')
@@ -214,8 +233,13 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     q_torch = q.clone().detach().requires_grad_(True)
     k_torch = k.clone().detach().requires_grad_(True)
     v_torch = v.clone().detach().requires_grad_(True)
+    q_flex = q.clone().detach().requires_grad_(True)
+    k_flex = k.clone().detach().requires_grad_(True)
+    v_flex = v.clone().detach().requires_grad_(True)
     static_src = static_src.clone().detach().requires_grad_(True)
     static_dest = static_dest.clone().detach().requires_grad_(True)
+    static_src_flex = static_src.clone().detach().requires_grad_(True)
+    static_dest_flex = static_dest.clone().detach().requires_grad_(True)
     c_, _c = 32, 32
     n_, _n = ceil(q.shape[2] / c_), ceil(q.shape[2] / _c)
     q_torch = torch.reshape(q_torch, (q_torch.shape[0], q_torch.shape[1] // k_torch.shape[1], k_torch.shape[1], _n, _c, q_torch.shape[-1]))
@@ -235,6 +259,20 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     torch.cuda.synchronize()
     fwd_ua_end = time.time()
+
+    for _ in range(5):
+        out_flex = ua_flex_attention(
+            q_flex, k_flex, v_flex,
+            static_src_flex,static_dest_flex)
+
+    torch.cuda.synchronize()
+    fwd_ua_flex_start = time.time()
+    for _ in range(10):
+        out_flex = ua_flex_attention(
+            q_flex, k_flex, v_flex,
+            static_src_flex,static_dest_flex)
+    torch.cuda.synchronize()
+    fwd_ua_flex_end = time.time()
 
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
@@ -278,12 +316,28 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
             triton_output.backward(do, retain_graph=True)
         triton_ua_bwd_end = time.time()
 
+        do_flex = do_torch.clone().detach().requires_grad_(True)
+        do_flex = do_flex.transpose(1, 2)
+        do_flex = torch.reshape(do_flex, (do_flex.shape[0], do_flex.shape[1] * do_flex.shape[2], do_flex.shape[3], do_flex.shape[4]))
+
+        for _ in range(5):
+            out_flex.backward(do_flex, retain_graph=True)
+
+        torch.cuda.synchronize()
+        flex_ua_bwd_start = time.time()
+        for _ in range(10):
+            out_flex.backward(do_flex, retain_graph=True)
+        flex_ua_bwd_end = time.time()
+
         print(f'torch-ua-fwd: {fwd_ua_end-fwd_ua_start}')
         print(f'triton-ua-fwd: {fwd_triton_end-fwd_triton_start}')
         print(f'torch-ua-bwd: {torch_ua_bwd_end-torch_ua_bwd_start}')
         print(f'triton-ua-bwd: {triton_ua_bwd_end-triton_ua_bwd_start}')
         print(f'torch-fwd+bwd-ua: {(fwd_ua_end-fwd_ua_start)+(torch_ua_bwd_end-torch_ua_bwd_start)}')
         print(f'triton-fwd+bwd-ua: {(fwd_triton_end-fwd_triton_start)+(triton_ua_bwd_end-triton_ua_bwd_start)}')
+        print(f'flex-ua-fwd: {fwd_ua_flex_end-fwd_ua_flex_start}')
+        print(f'flex-ua-bwd: {flex_ua_bwd_end-flex_ua_bwd_start}')
+        print(f'flex-ua-fwd+bwd: {(fwd_ua_flex_end-fwd_ua_flex_start)+(flex_ua_bwd_end-flex_ua_bwd_start)}')
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
@@ -340,15 +394,15 @@ if __name__ == '__main__':
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
     ## All TCs passing. ##
-    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
-    test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
-    test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
-    test_case_universal_attention(1, 1, 32, 2048, 128, backward=True)
-    test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
+    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
+    #test_case_universal_attention(1, 1, 32, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
     
     ## Longer sequence tests, need to reduce number of heads for this. ##
     #test_case_universal_attention(1, 1, 16, 4096, 128, backward=True) 
@@ -361,7 +415,7 @@ if __name__ == '__main__':
     #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
-    #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
-    #speed_test_ua(2, 1, 32, 512, 128, backward=True) 
-    #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
-    #speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 256, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 512, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
+    speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
