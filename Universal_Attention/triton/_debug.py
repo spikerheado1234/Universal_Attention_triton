@@ -7,6 +7,7 @@ from universal_attention_kernel import universal_attention_forward
 from math import ceil
 import time
 from torch.nn.attention.flex_attention import flex_attention
+from affinity_kernel import _gen_affinity_scores as AffKern
 
 def sdpa_torch(q, k, v, causal=False):
     """
@@ -161,6 +162,24 @@ def _debug_triton_fused_gqa_mhsa(q,k,v, backward=False, causal=False):
         print(f'dq allclose: {torch.allclose(q_torch.grad, q.grad, atol=1e-1, rtol=1e-1)}')
         print(f'dk allclose: {torch.allclose(k_torch.grad, k.grad, atol=1, rtol=1)}')
         print(f'dv allclose: {torch.allclose(v_torch.grad, v.grad, atol=1, rtol=1)}')
+
+
+def _profile_triton_affinity_creation(q,k,v,static_src,static_dest,backward=False,causal=True):
+    assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
+    q_torch = q.clone().detach().requires_grad_(True)
+    k_torch = k.clone().detach().requires_grad_(True)
+    v_torch = v.clone().detach().requires_grad_(True)
+    static_src_torch = static_src.clone().detach().requires_grad_(True)
+    static_dest_torch = static_dest.clone().detach().requires_grad_(True)
+    static_src_torch = torch.reshape(static_src_torch, (static_src_torch.shape[0], static_src_torch.shape[1], n_, c_))
+    static_dest_torch = torch.reshape(static_dest_torch, (static_dest_torch.shape[0], static_dest_torch.shape[1], _n, _c))
+    affinities_torch = _gen_affinity_scores(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
+    sm_scale = 1.3
+    fn = lambda: AffKern(k, static_src, static_dest)
+    triton_output = fn()
+    do = torch.randn_like(affinities_torch).to(q.device)
+    if backward:
+        triton_output.backward(do)
 
 def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
@@ -366,6 +385,25 @@ def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=Fa
     static_dest.requires_grad_(True)
     _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
 
+def profile_affinity_creation(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
+    ## This is a profiling pass, to ensure that we launch singular kernels only.
+    print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
+    causal = True
+    device="cuda" if torch.cuda.is_available() else "cpu"
+    #dtype=torch.float32
+    dtype=torch.bfloat16
+    q = torch.rand((BATCH, Q_H * KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    k = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device) 
+    k /= k.pow(2).sum(-1, True).sqrt().add(1e-6)
+    k.requires_grad_(True)
+    v = torch.rand((BATCH, KV_H, N_CTX, HEAD_DIM), dtype=dtype, device=device, requires_grad=True)
+    static_src = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device).sigmoid()
+    static_src.requires_grad_(True)
+    static_dest = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device).sigmoid()
+    static_dest.requires_grad_(True)
+    _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
+
+
 def speed_test_ua(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=True):
     print(f'--------SPEED-TEST BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
     causal = True
@@ -415,7 +453,9 @@ if __name__ == '__main__':
     #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
-    speed_test_ua(2, 1, 32, 256, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 512, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
-    speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 512, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
+    #speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
+
+    _profile_triton_affinity_creation(2, 1, 32, 2048, 128, backward=True)
