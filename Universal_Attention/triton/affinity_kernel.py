@@ -1,6 +1,7 @@
 import torch
 from torch.autograd import Function
 import torch.nn.functional as F
+import nvtx
 
 import triton
 import triton.language as tl
@@ -531,35 +532,39 @@ def _affinity_bwd(k, src, dest, daff):
     grid_i = (b, h, triton.cdiv(l, BLOCK_I))
     grid_j = (b, h, triton.cdiv(l, BLOCK_J))
 
-    _aff_bwd_pre_cs_kernel[grid](
-        daff, daff_pre_cs,
-        daff.stride(0), daff.stride(1), daff.stride(2), daff.stride(3),
-        daff_pre_cs.stride(0), daff_pre_cs.stride(1), daff_pre_cs.stride(2), daff_pre_cs.stride(3),
-        B=b, H=h, L=l,
-        BLOCK_I=BLOCK_I, BLOCK_J=BLOCK_J 
-    )
+    with nvtx.annotate("_aff_bwd_pre_cs_kernel", color="green"):
+        _aff_bwd_pre_cs_kernel[grid](
+            daff, daff_pre_cs,
+            daff.stride(0), daff.stride(1), daff.stride(2), daff.stride(3),
+            daff_pre_cs.stride(0), daff_pre_cs.stride(1), daff_pre_cs.stride(2), daff_pre_cs.stride(3),
+            B=b, H=h, L=l,
+            BLOCK_I=BLOCK_I, BLOCK_J=BLOCK_J 
+        )
     
     # Do cumsum in pytorch
-    local_sum = torch.flip(daff_pre_cs[..., 0:l:BLOCK_J], dims=[-1])
-    global_sum = torch.flip(torch.cumsum(F.pad(local_sum, (1, 0))[..., :-1], dim=-1), dims=[-1]).contiguous()
-    
-    local_sum = daff_pre_cs[..., 0:l:BLOCK_J]                 
-    global_sum = torch.flip(torch.cumsum(torch.flip(local_sum, (-1,)), dim=-1), (-1,))
-    global_sum = torch.roll(global_sum, shifts=-1, dims=-1)
-    global_sum[..., -1] = 0
+    with nvtx.annotate("torch_funcs", color="blue"):
+        local_sum = torch.flip(daff_pre_cs[..., 0:l:BLOCK_J], dims=[-1])
+        global_sum = torch.flip(torch.cumsum(F.pad(local_sum, (1, 0))[..., :-1], dim=-1), dims=[-1]).contiguous()
+        
+        local_sum = daff_pre_cs[..., 0:l:BLOCK_J]                 
+        global_sum = torch.flip(torch.cumsum(torch.flip(local_sum, (-1,)), dim=-1), (-1,))
+        global_sum = torch.roll(global_sum, shifts=-1, dims=-1)
+        global_sum[..., -1] = 0
 
-    _aff_bwd_post_cs_kernel[grid](
-        k, src, dest, daff_pre_cs, global_sum, daff_post_cs, daff_kkt,
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        src.stride(0), src.stride(1), src.stride(2), 
-        dest.stride(0), dest.stride(1), dest.stride(2),
-        daff_pre_cs.stride(0), daff_pre_cs.stride(1), daff_pre_cs.stride(2), daff_pre_cs.stride(3), 
-        global_sum.stride(0), global_sum.stride(1), global_sum.stride(2), global_sum.stride(3), 
-        daff_post_cs.stride(0), daff_post_cs.stride(1), daff_post_cs.stride(2), daff_post_cs.stride(3), 
-        daff_kkt.stride(0), daff_kkt.stride(1), daff_kkt.stride(2), daff_kkt.stride(3), 
-        B=b, H=h, L=l, D=d,
-        BLOCK_I=BLOCK_I, BLOCK_J=BLOCK_J 
-    )
+
+    with nvtx.annotate("_aff_bwd_post_cs_kernel", color="red"):
+        _aff_bwd_post_cs_kernel[grid](
+            k, src, dest, daff_pre_cs, global_sum, daff_post_cs, daff_kkt,
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            src.stride(0), src.stride(1), src.stride(2), 
+            dest.stride(0), dest.stride(1), dest.stride(2),
+            daff_pre_cs.stride(0), daff_pre_cs.stride(1), daff_pre_cs.stride(2), daff_pre_cs.stride(3), 
+            global_sum.stride(0), global_sum.stride(1), global_sum.stride(2), global_sum.stride(3), 
+            daff_post_cs.stride(0), daff_post_cs.stride(1), daff_post_cs.stride(2), daff_post_cs.stride(3), 
+            daff_kkt.stride(0), daff_kkt.stride(1), daff_kkt.stride(2), daff_kkt.stride(3), 
+            B=b, H=h, L=l, D=d,
+            BLOCK_I=BLOCK_I, BLOCK_J=BLOCK_J 
+        )
 
     # Two separate independent kernels for row-major and column-major reductions
     # s_i = torch.cuda.Stream()
