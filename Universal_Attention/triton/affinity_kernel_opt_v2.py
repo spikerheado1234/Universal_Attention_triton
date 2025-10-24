@@ -123,7 +123,7 @@ def _affinity_fwd(k, src, dest):
         B=b, H=h, L=l, D=d, BLOCK_D=d,
     )
 
-    return aff.transpose(-1, -2).to(k.dtype)
+    return aff.transpose(-1, -2).to(k.dtype).contiguous()
 
 '''
 #######################################
