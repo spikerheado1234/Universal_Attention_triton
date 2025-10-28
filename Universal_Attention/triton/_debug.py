@@ -434,8 +434,8 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     for _ in range(5):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
 
-    fwd_sdpa_start = time.time()
     torch.cuda.synchronize()
+    fwd_sdpa_start = time.time()
     for _ in range(10):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
     torch.cuda.synchronize()
@@ -508,6 +508,7 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         triton_ua_bwd_start = time.time()
         for _ in range(10):
             triton_output.backward(do, retain_graph=True)
+        torch.cuda.synchronize()
         triton_ua_bwd_end = time.time()
 
         do_flex = do_torch.clone().detach().requires_grad_(True)
@@ -663,8 +664,9 @@ if __name__ == '__main__':
     #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
     #speed_test_ua(2, 1, 32, 512, 128, backward=True) 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
-    speed_test_ua(2, 4, 8, 1024, 128, backward=True)  ## -> Llama 3.1-8bn configuration.
-    #speed_test_ua(2, 1, 32, 2048, 128, backward=True) 
+    #speed_test_ua(2, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration.
+    speed_test_ua(4, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration that I am testing end-to-end.
+    #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
     #profile_affinity_creation(1, 1, 8, 4096, 128, backward=True)
     #profile_affinity_creation(1, 1, 8, 128, 128, backward=True)
