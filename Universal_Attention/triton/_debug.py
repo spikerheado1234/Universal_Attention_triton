@@ -659,6 +659,7 @@ if __name__ == '__main__':
     #test_case_universal_attention(1, 2, 16, 2048, 128, backward=True)
     #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     #test_case_universal_attention(2, 2, 16, 1024, 128, backward=True) 
+    #test_case_universal_attention(4, 4, 8, 1024, 128, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
     #speed_test_ua(2, 1, 32, 256, 128, backward=True) 

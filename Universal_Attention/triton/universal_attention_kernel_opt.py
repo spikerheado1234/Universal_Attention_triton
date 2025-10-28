@@ -3,8 +3,6 @@ import triton
 import triton.language as tl
 from affinity_kernel_opt_v2 import _affinity_bwd, _affinity_fwd
 
-import pdb
-
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
@@ -13,22 +11,6 @@ def is_cuda():
 
 def supports_host_descriptor():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
-
-def get_cuda_configs():
-    configs = []
-
-    for BLOCK_M in [32, 64, 128, 256]:
-        for BLOCK_N in [32, 64, 128, 256]:
-            configs.append(triton.Config({"BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N}, num_stages=2, num_warps=8))
-
-    return configs
-
-def _gen_affinity_scores(k, src, dest):
-    kkt = torch.einsum('bnqh, bnkh -> bnqk', k, k).relu().pow(2/3).float()
-    affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
-    affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
-    affinity = affinity.triu(1).cumsum(3)
-    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12), -1, -2).contiguous().to(k.dtype)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -61,8 +43,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         qk = tl.dot(q, k)
         qk += aff
         if STAGE == 2:
-            #mask = (offs_m[:, None] >= (start_n + offs_n[None, :])) & ((start_n + offs_n[None, :]) < N_CTX) & (offs_m[:, None] < N_CTX)
-            #qk = qk + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
         else:
@@ -89,10 +69,6 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offseta_y += BLOCK_N
     return acc, l_i, m_i
 
-#@triton.autotune(
-#        configs=get_cuda_configs(),
-#        key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"]
-#        )
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, desc_affinity,
@@ -425,7 +401,6 @@ class _attention(torch.autograd.Function):
 
         ## Here, we launch an affinity matrix calculation kernel to simplify implementation. ##
         desc_affinity = _affinity_fwd(k, static_src, static_dest)
-        #desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
 
         ## Specialize to this blk size for reasonable performance. ##
         BLOCK_M=128
@@ -469,28 +444,33 @@ class _attention(torch.autograd.Function):
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         PRE_BLOCK = 128
         NUM_WARPS, NUM_STAGES = 4, 3
-        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
         BLK_SLICE_FACTOR = 2
         PRE_BLOCK = 128
-        ## Remove this strict assertion.
-        #assert N_CTX % PRE_BLOCK == 0
-        pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
-        delta = torch.empty_like(M) ## (batch, qv_heads, N_CTX)
-        _attn_bwd_preprocess[pre_grid](
-            o, do,  #
-            delta,  #
-            BATCH, N_HEAD, N_CTX,  #
-            BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
-        )
-        ## Recompute affinity scores. ##
-        ## Turn on autodiff for this. ##
-        affinity = _affinity_fwd(k, static_src, static_dest)
-        #with torch.enable_grad():
-        #    affinity = _gen_affinity_scores(k, static_src, static_dest) ## (b, KV_H, N_CTX, N_CTX)
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
-        daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
-        
+
+        ## We leverage streams for extra parallelism. Seems to help a little bit. ##
+        s1 = torch.cuda.Stream()
+        s2 = torch.cuda.Stream()
+
+        pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
+        with torch.cuda.stream(s1):
+            delta = torch.empty_like(M) ## (batch, qv_heads, N_CTX)
+            _attn_bwd_preprocess[pre_grid](
+                o, do,  #
+                delta,  #
+                BATCH, N_HEAD, N_CTX,  #
+                BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
+            )
+        ## Recompute affinity scores. ##
+        with torch.cuda.stream(s2):
+            affinity = _affinity_fwd(k, static_src, static_dest)
+            daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
+
+        s1.synchronize() 
+        s2.synchronize()
+
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
         _attn_bwd[grid](
@@ -509,10 +489,7 @@ class _attention(torch.autograd.Function):
         
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
         
-        ## Use AOTAutograd for the rest. This is for simplicity and for the sake of moving fast. 
-        ##   TODO(ahangupta): optimize out into triton kernel later.
         dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
-        #dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
         dk += dk_new
         return dq, dk, dv, None, None, dsrc, ddest, None
     
