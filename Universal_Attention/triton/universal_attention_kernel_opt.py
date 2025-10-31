@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 from affinity_kernel_opt_v2 import _affinity_bwd, _affinity_fwd
 
 def is_hip():
@@ -11,6 +12,13 @@ def is_cuda():
 
 def supports_host_descriptor():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+
+def _gen_affinity_scores(k, src, dest):
+    kkt = torch.einsum('bnqh, bnkh -> bnqk', k, k).relu().pow(2/3).float()
+    affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
+    affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
+    affinity = affinity.triu(1).cumsum(3)
+    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1e12), -1, -2).contiguous().to(k.dtype)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -386,7 +394,17 @@ class _attention(torch.autograd.Function):
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
-        assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        if HEAD_DIM_K not in {16, 32, 64, 128, 256}:
+            ## Then we zero-pad everything. ##
+            from math import ceil, log2
+            pow_two = int(ceil(log2(HEAD_DIM_K)))
+            assert 2**pow_two <= 256, 'Head hidden dim until 256 supported only!'
+            pad_amt = (2**pow_two)-HEAD_DIM_K
+            q = F.pad(q, (0, pad_amt), "constant", 0)
+            k = F.pad(k, (0, pad_amt), "constant", 0)
+            v = F.pad(v, (0, pad_amt), "constant", 0)
+
+        assert q.shape[-1] in {16, 32, 64, 128, 256}, f'head_dim {q.shape[-1]} must be in [16, 32, 64, 128, 256]'
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -413,7 +431,7 @@ class _attention(torch.autograd.Function):
             q.shape[0], q.shape[1],  #
             desc_q, desc_k, desc_v, desc_o, desc_affinity,  #
             N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
+            HEAD_DIM=q.shape[-1],  #
             BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
             BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
             FP8_OUTPUT=False,
@@ -430,14 +448,28 @@ class _attention(torch.autograd.Function):
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
-        return o
+        return o[:, :, :, :HEAD_DIM_K]
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, M, static_src, static_dest = ctx.saved_tensors
         do = do.contiguous()
         assert do.is_contiguous()
+
+        ## Custom logic to zero-pad tensors. ##
+        HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V, HEAD_DIM_DO = q.shape[-1], k.shape[-1], v.shape[-1], do.shape[-1]
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+
+        ## Now, do may not be the same shape as everything else due to zero-padding. 
+        ## So we accordingly adjust.
+        if do.stride() != q.stride():
+            assert q.shape[-1] >= do.shape[-1], 'Padding in fwd pass probably incorrect.'
+            pad_amt = q.shape[-1] - do.shape[-1]
+            do = F.pad(do, (0, pad_amt), "constant", 0)
+
+        ## Final check to see if everything is correct. ##
         assert q.stride() == do.stride() == o.stride() and k.stride() == v.stride()
+
         dq = torch.empty_like(q)
         dk = torch.empty_like(k)
         dv = torch.empty_like(v)
@@ -461,7 +493,7 @@ class _attention(torch.autograd.Function):
                 o, do,  #
                 delta,  #
                 BATCH, N_HEAD, N_CTX,  #
-                BLOCK_M=PRE_BLOCK, HEAD_DIM=ctx.HEAD_DIM  #
+                BLOCK_M=PRE_BLOCK, HEAD_DIM=do.shape[-1]  #
             )
         ## Recompute affinity scores. ##
         with torch.cuda.stream(s2):
@@ -481,7 +513,7 @@ class _attention(torch.autograd.Function):
             BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
             BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
-            HEAD_DIM=ctx.HEAD_DIM,  #
+            HEAD_DIM=do.shape[-1],  #
             causal=ctx.causal,
             num_warps=NUM_WARPS,  #
             num_stages=NUM_STAGES  #
@@ -491,6 +523,6 @@ class _attention(torch.autograd.Function):
         
         dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
         dk += dk_new
-        return dq, dk, dv, None, None, dsrc, ddest, None
+        return dq[:, :, :, :ctx.HEAD_DIM], dk[:,:,:,:ctx.HEAD_DIM], dv[:,:,:,:ctx.HEAD_DIM], None, None, dsrc, ddest, None
     
 attention = _attention.apply

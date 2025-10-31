@@ -660,13 +660,18 @@ if __name__ == '__main__':
     #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     #test_case_universal_attention(2, 2, 16, 1024, 128, backward=True) 
     #test_case_universal_attention(4, 4, 8, 1024, 128, backward=True) 
+    ## More custom configs to enhance Davis' experience in using this kernel. ##
+    #test_case_universal_attention(4, 4, 5, 1024, 64, backward=True) 
+    #test_case_universal_attention(4, 4, 4, 1024, 64, backward=True) 
+    test_case_universal_attention(4, 4, 4, 1024, 80, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
     #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
     #speed_test_ua(2, 1, 32, 512, 128, backward=True) 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
     #speed_test_ua(2, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration.
-    speed_test_ua(4, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration that I am testing end-to-end.
+    #speed_test_ua(4, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration that I am testing end-to-end.
+
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
     #profile_affinity_creation(1, 1, 8, 4096, 128, backward=True)
