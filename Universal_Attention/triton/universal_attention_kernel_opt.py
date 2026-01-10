@@ -50,6 +50,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         k = tl.trans(tl.load(desc_k + k_ptr, mask=(tl.arange(0, BLOCK_N)+start_n)[:,None] < N_CTX, other=0.0))
         qk = tl.dot(q, k)
         qk += aff
+        mask = (offs_m[:, None] >= (start_n + offs_n[None, :])) & ((start_n + offs_n[None, :]) < N_CTX) & (offs_m[:, None] < N_CTX)
+        qk = qk + tl.where(mask, 0, -1.0e8)  ## Let's see if this extra masking fixes everything. ##
         if STAGE == 2:
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
@@ -482,26 +484,17 @@ class _attention(torch.autograd.Function):
         Q_H = N_HEAD // k.shape[1]
         KV_H = k.shape[1]
 
-        ## We leverage streams for extra parallelism. Seems to help a little bit. ##
-        s1 = torch.cuda.Stream()
-        s2 = torch.cuda.Stream()
-
         pre_grid = (triton.cdiv(N_CTX, PRE_BLOCK), BATCH * N_HEAD)
-        with torch.cuda.stream(s1):
-            delta = torch.empty_like(M) ## (batch, qv_heads, N_CTX)
-            _attn_bwd_preprocess[pre_grid](
-                o, do,  #
-                delta,  #
-                BATCH, N_HEAD, N_CTX,  #
-                BLOCK_M=PRE_BLOCK, HEAD_DIM=do.shape[-1]  #
-            )
+        delta = torch.empty_like(M) ## (batch, qv_heads, N_CTX)
+        _attn_bwd_preprocess[pre_grid](
+            o, do,  #
+            delta,  #
+            BATCH, N_HEAD, N_CTX,  #
+            BLOCK_M=PRE_BLOCK, HEAD_DIM=do.shape[-1]  #
+        )
         ## Recompute affinity scores. ##
-        with torch.cuda.stream(s2):
-            affinity = _affinity_fwd(k, static_src, static_dest)
-            daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
-
-        s1.synchronize() 
-        s2.synchronize()
+        affinity = _affinity_fwd(k, static_src, static_dest)
+        daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
 
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5

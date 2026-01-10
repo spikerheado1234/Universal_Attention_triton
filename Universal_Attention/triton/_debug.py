@@ -4,7 +4,6 @@ from torch.nn import functional as F
 import os
 from universal_attention_kernel_opt import attention, _gen_affinity_scores
 from math import sqrt
-import pdb
 from universal_attention_kernel import universal_attention_forward
 from math import ceil
 import time
@@ -350,9 +349,9 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     flex_attention_output = ua_flex_attention(q_flex, k_flex, v_flex, static_src_flex, static_dest_flex)
     sdpa_attention_output = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
     do_torch = torch.randn_like(torch_output).to(q.device)
-    print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
-    print(f'outputs allclose-flex: {torch.allclose(torch.nan_to_num(flex_attention_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
-    print(f'outputs allclose-flex vs. triton: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(flex_attention_output), atol=1e-2, rtol=1e-2)}')
+    #print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
+    #print(f'outputs allclose-flex: {torch.allclose(torch.nan_to_num(flex_attention_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
+    #print(f'outputs allclose-flex vs. triton: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(flex_attention_output), atol=1e-2, rtol=1e-2)}')
     print(f'outputs allclose-sdpa vs. triton: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(sdpa_attention_output), atol=1e-2, rtol=1e-2)}')
     ## For debugging purposes only. ##
     #idx_nc = helper_which_notclose(triton_output, torch_output.view(triton_output.shape), rtol=1e-1)
@@ -377,27 +376,29 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(k.grad), atol=1, rtol=1)}')
         #print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(static_src.grad), atol=1, rtol=1)}')
         #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
-        print('-----sanity-------')
+        #print('-----sanity-------')
         dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
-        print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
         
         ## Comparison against flex attention. ##
-        print('-----flex_attn-------')
-        print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q.grad), torch.nan_to_num(q_flex.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_flex.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_flex.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_flex.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_flex.grad), atol=1e-1, rtol=1e-1)}')
+        #print('-----flex_attn-------')
+        #print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q.grad), torch.nan_to_num(q_flex.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_flex.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_flex.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_flex.grad), atol=1e-1, rtol=1e-1)}')
+        #print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_flex.grad), atol=1e-1, rtol=1e-1)}')
         print('-----sdpa_attn-------')
         print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q.grad), torch.nan_to_num(q_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_sdpa.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_sdpa.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_sdpa.grad), atol=1e-1, rtol=1e-1)}')
-        print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-1, rtol=1e-1)}')
+        print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        import pdb
+        pdb.set_trace()
 
         #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(dqc), atol=1, rtol=1)}')
         #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(dvc), atol=1, rtol=1)}')
@@ -638,7 +639,7 @@ if __name__ == '__main__':
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
     ## All TCs passing. ##
-    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
@@ -663,7 +664,7 @@ if __name__ == '__main__':
     ## More custom configs to enhance Davis' experience in using this kernel. ##
     #test_case_universal_attention(4, 4, 5, 1024, 64, backward=True) 
     #test_case_universal_attention(4, 4, 4, 1024, 64, backward=True) 
-    test_case_universal_attention(4, 4, 4, 1024, 80, backward=True) 
+    #test_case_universal_attention(4, 4, 4, 1024, 80, backward=True) 
     
     ## SPEED TESTS TO ASSESS PERFORMANCE ##
     #speed_test_ua(2, 1, 32, 256, 128, backward=True) 
