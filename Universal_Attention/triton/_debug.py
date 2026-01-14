@@ -2,7 +2,7 @@
 import torch
 from torch.nn import functional as F
 import os
-from universal_attention_kernel_opt import attention, _gen_affinity_scores
+from universal_attention_kernel_opt import attention, _gen_affinity_scores as GenAffTorch
 from math import sqrt
 from universal_attention_kernel import universal_attention_forward
 from math import ceil
@@ -10,7 +10,7 @@ import time
 from torch.nn.attention.flex_attention import flex_attention
 from affinity_kernel import _gen_affinity_scores as AffKern
 from affinity_kernel_opt import _gen_affinity_scores as AffKernOpt
-from affinity_kernel_opt_v2 import _gen_affinity_scores as AffKernOptV2
+from affinity_kernel_opt_v2 import _gen_affinity_scores as AffKernOptV2, _affinity_fwd, _affinity_bwd
 
 def sdpa_torch(q, k, v, causal=False):
     """
@@ -96,14 +96,13 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     ## Gen affinity scores already does this, so there's no need for this right now. ##
     #qk += torch.triu(torch.full(qk.shape, -1e6), diagonal=1).to(qk.device)
 
-    affinity = _gen_affinity_scores(k, src, dest)
+    affinity = GenAffTorch(k, src, dest)
     qk += affinity.unsqueeze(1)
     attn = torch.nn.functional.softmax(qk, dim=-1, dtype=torch.float32)
     attn = attn.to(q.dtype)
     o = torch.einsum('brnqk, bnkh -> brnqh', attn.to(dtype=q.dtype), v)
 
     ## Now, we compute the gradients. ##
-
     ## dv. ##
     dv = torch.einsum('brnqk, brnqh -> bnkh', attn, incoming_gradients)
 
@@ -118,7 +117,6 @@ def ua_bwd(q, k, v, src, dest, incoming_gradients):
     dkt, dsrc, ddest = torch.autograd.grad(affinity, [k, src, dest], grad_outputs=dp.sum(1, keepdim=False))
     dk += dkt
 
-    #return dq.transpose(1, 2), dk, dv, dsrc, ddest
     return torch.reshape(dq, incoming_query_shape), dk, dv, dsrc, ddest
 
 def make_universal_score_mod(k: torch.Tensor, src: torch.Tensor, dest: torch.Tensor):
@@ -128,7 +126,7 @@ def make_universal_score_mod(k: torch.Tensor, src: torch.Tensor, dest: torch.Ten
     The returned callable closes over a precomputed affinity tensor to avoid
     recomputing O(N^2) work per callback.
     """
-    affs = _gen_affinity_scores(k, src, dest)
+    affs = GenAffTorch(k, src, dest)
     scale_fix = sqrt(k.shape[-1]) 
 
     def score_mod(score, b: int, h: int, q_idx: int, k_idx: int):
@@ -156,7 +154,7 @@ def ua_sdpa(q, k, v, src, dest):
         src = src.repeat(1, q.shape[1]//src.shape[1], 1)
         dest = dest.repeat(1, q.shape[1]//dest.shape[1], 1)
 
-    affs = _gen_affinity_scores(k, src, dest)
+    affs = GenAffTorch(k, src, dest)
     torch.backends.cuda.enable_math_sdp(False)
     attn = F.scaled_dot_product_attention(
         q, 
@@ -304,15 +302,36 @@ def _speed_test_triton_affinity_creation(q,k,v,static_src,static_dest,backward=F
     print(f'triton v1 e2e time: {(triton_v1_end_fwd-triton_v1_start_fwd)+(triton_v1_end_bwd-triton_v1_start_bwd)}')
     print(f'triton v2 e2d time: {(triton_v2_end_fwd-triton_v2_start_fwd)+(triton_v2_end_bwd-triton_v2_start_bwd)}')
 
-def helper_which_notclose(one: torch.tensor, two: torch.tensor, rtol: float):
-    diffs = torch.abs(one) - torch.abs(two)
+def helper_which_notclose(one: torch.tensor, two: torch.tensor, atol: float, rtol: float):
+    diffs = torch.abs(one - two)
 
-    idx = diffs >= rtol
+    idx = diffs > rtol * torch.abs(two) + atol
 
     print(f'one: {one[idx]}\n, two: {two[idx]}')
-    print(f'idxs: {idx.nonzero()}')
+    print(f'idxs: {idx.nonzero()}\n idxs size: {idx.nonzero().shape}')
 
     return idx
+
+def _debug_affinity_generation(k,static_src,static_dest):
+    k_torch = k.clone().detach().requires_grad_(True)
+    static_src_torch = static_src.clone().detach().requires_grad_(True)
+    static_dest_torch = static_dest.clone().detach().requires_grad_(True)
+
+    torch_output = GenAffTorch(k_torch, static_src_torch, static_dest_torch)
+    custom_output = _affinity_fwd(k, static_src, static_dest)
+    print(f'outputs allclose-sdpa vs. triton (affinity-only): {torch.allclose(torch.nan_to_num(custom_output), torch.nan_to_num(torch_output), atol=1e-2, rtol=1e-2)}')
+
+    ## make daff. ##
+    daff_torch = torch.randn_like(torch_output).to(k.device)
+    daff_custom = daff_torch.clone().detach()
+
+    ## Then invoke backwards pass. ##
+    torch_output.backward(daff_torch)
+    dk, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daff_custom)
+    print(f'dk allclose-sdpa vs. triton (affinity-only): {torch.allclose(torch.nan_to_num(dk), torch.nan_to_num(k_torch.grad), atol=1e-2, rtol=1e-2)}')
+    print(f'dsrc allclose-sdpa vs. triton (affinity-only): {torch.allclose(torch.nan_to_num(dsrc), torch.nan_to_num(static_src_torch.grad), atol=1e-2, rtol=1e-2)}')
+    print(f'ddest allclose-sdpa vs. triton (affinity-only): {torch.allclose(torch.nan_to_num(ddest), torch.nan_to_num(static_dest_torch.grad), atol=1e-2, rtol=1e-2)}')
+
 
 def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
@@ -339,72 +358,41 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     v_torch = torch.reshape(v_torch, (v_torch.shape[0], v_torch.shape[1], n_, c_, v_torch.shape[-1]))
     static_src_torch = torch.reshape(static_src_torch, (static_src_torch.shape[0], static_src_torch.shape[1], n_, c_))
     static_dest_torch = torch.reshape(static_dest_torch, (static_dest_torch.shape[0], static_dest_torch.shape[1], _n, _c))
-    out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
-    torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
+    #out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
+    #torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
     sm_scale = 1.3
     ## We print out stuff and run in interpreter mode to help us debug. ##
     fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
     triton_output = fn()
     ## Temporarily comment out flex attention to remove the need to make it support GQA. ##
-    flex_attention_output = ua_flex_attention(q_flex, k_flex, v_flex, static_src_flex, static_dest_flex)
     sdpa_attention_output = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
-    do_torch = torch.randn_like(torch_output).to(q.device)
-    #print(f'outputs allclose: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
-    #print(f'outputs allclose-flex: {torch.allclose(torch.nan_to_num(flex_attention_output), torch.nan_to_num(torch_output.view(triton_output.shape)), atol=1e-1, rtol=1e-1)}')
-    #print(f'outputs allclose-flex vs. triton: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(flex_attention_output), atol=1e-2, rtol=1e-2)}')
+    do_torch = torch.randn_like(triton_output).to(q.device)
     print(f'outputs allclose-sdpa vs. triton: {torch.allclose(torch.nan_to_num(triton_output), torch.nan_to_num(sdpa_attention_output), atol=1e-2, rtol=1e-2)}')
     ## For debugging purposes only. ##
-    #idx_nc = helper_which_notclose(triton_output, torch_output.view(triton_output.shape), rtol=1e-1)
     if backward:
         q_torch.retain_grad()
         k_torch.retain_grad()
         v_torch.retain_grad()
         static_src_torch.retain_grad()
         static_dest_torch.retain_grad()
-        torch_output.backward(do_torch) ## (b,h,r,l,d)
         do = do_torch.clone().detach().requires_grad_(True)
-        do = do.transpose(1, 2)
-        do = torch.reshape(do, (do.shape[0], do.shape[1] * do.shape[2], do.shape[3], do.shape[4]))
         triton_output.backward(do)
-        do_flex = do.clone().detach().requires_grad_(True)
-        flex_attention_output.backward(do_flex)
         do_sdpa = do.clone().detach().requires_grad_(True)
         sdpa_attention_output.backward(do_sdpa)
-        #print('------custom-------')
-        #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(q.grad.shape), torch.nan_to_num(q.grad), atol=1, rtol=1)}')
-        #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(v.grad.shape), torch.nan_to_num(v.grad), atol=1, rtol=1)}')
-        #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(k.grad.shape), torch.nan_to_num(k.grad), atol=1, rtol=1)}')
-        #print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(static_src.grad.shape), torch.nan_to_num(static_src.grad), atol=1, rtol=1)}')
-        #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(static_dest.grad.shape), torch.nan_to_num(static_dest.grad), atol=1, rtol=1)}')
-        #print('-----sanity-------')
-        dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
-        #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(q.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(v.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(k.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(static_src.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(static_dest.grad), atol=1e-1, rtol=1e-1)}')
-        
-        ## Comparison against flex attention. ##
-        #print('-----flex_attn-------')
-        #print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q.grad), torch.nan_to_num(q_flex.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_flex.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_flex.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_flex.grad), atol=1e-1, rtol=1e-1)}')
-        #print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_flex.grad), atol=1e-1, rtol=1e-1)}')
         print('-----sdpa_attn-------')
         print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(q.grad), torch.nan_to_num(q_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(v.grad), torch.nan_to_num(v_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        import pdb
-        pdb.set_trace()
-
-        #print(f'dq allclose: {torch.allclose(torch.nan_to_num(q_torch.grad).reshape(dqc.shape), torch.nan_to_num(dqc), atol=1, rtol=1)}')
-        #print(f'dv allclose: {torch.allclose(torch.nan_to_num(v_torch.grad).reshape(dvc.shape), torch.nan_to_num(dvc), atol=1, rtol=1)}')
-        #print(f'dk allclose: {torch.allclose(torch.nan_to_num(k_torch.grad).reshape(dkc.shape), torch.nan_to_num(dkc), atol=1, rtol=1)}')
-        #print(f'dsrc allclose: {torch.allclose(torch.nan_to_num(static_src_torch.grad).reshape(dsrcc.shape), torch.nan_to_num(dsrcc), atol=1, rtol=1)}')
-        #print(f'ddest allclose: {torch.allclose(torch.nan_to_num(static_dest_torch.grad).reshape(ddestc.shape), torch.nan_to_num(ddestc), atol=1, rtol=1)}')
+        dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
+        print('-----ua_torch vs. sdpa version-------')
+        print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(dqc), torch.nan_to_num(q_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(dkc), torch.nan_to_num(k_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(dvc), torch.nan_to_num(v_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(dsrcc), torch.nan_to_num(static_src_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(ddestc), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-2, rtol=1e-2)}')
+        #helper_which_notclose(dvc, v_sdpa.grad, 1e-2, 1e-2)
 
 def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
@@ -413,11 +401,6 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     v_torch = v.clone().detach().requires_grad_(True)
     static_src = static_src.clone().detach().requires_grad_(True)
     static_dest = static_dest.clone().detach().requires_grad_(True)
-    q_flex = q.clone().detach().requires_grad_(True)
-    k_flex = k.clone().detach().requires_grad_(True)
-    v_flex = v.clone().detach().requires_grad_(True)
-    static_src_flex = static_src.clone().detach().requires_grad_(True)
-    static_dest_flex = static_dest.clone().detach().requires_grad_(True)
     q_sdpa = q.clone().detach().requires_grad_(True)
     k_sdpa = k.clone().detach().requires_grad_(True)
     v_sdpa = v.clone().detach().requires_grad_(True)
@@ -442,32 +425,6 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     torch.cuda.synchronize()
     fwd_sdpa_end = time.time()
 
-    for _ in range(5):
-        out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
-        torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
-
-    torch.cuda.synchronize()
-    fwd_ua_start = time.time()
-    for _ in range(10):
-        out, denom = universal_attention_forward(k_torch, v_torch, q_torch,static_src=static_src_torch,static_dest=static_dest_torch)
-        torch_output = out.mul(denom.softmax(dim=-1).unsqueeze(-2)).sum(-1)
-    torch.cuda.synchronize()
-    fwd_ua_end = time.time()
-
-    for _ in range(5):
-        out_flex = ua_flex_attention(
-            q_flex, k_flex, v_flex,
-            static_src_flex,static_dest_flex)
-
-    torch.cuda.synchronize()
-    fwd_ua_flex_start = time.time()
-    for _ in range(10):
-        out_flex = ua_flex_attention(
-            q_flex, k_flex, v_flex,
-            static_src_flex,static_dest_flex)
-    torch.cuda.synchronize()
-    fwd_ua_flex_end = time.time()
-
     sm_scale = 1.3
     fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
     for _ in range(5):
@@ -480,7 +437,6 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     torch.cuda.synchronize()
     fwd_triton_end = time.time()
 
-    do_torch = torch.randn_like(torch_output).to(q.device)
     if backward:
         q_torch.retain_grad()
         k_torch.retain_grad()
@@ -488,19 +444,7 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         static_src_torch.retain_grad()
         static_dest_torch.retain_grad()
 
-        for _ in range(5):
-            torch_output.backward(do_torch, retain_graph=True) ## (b,h,r,l,d)
-
-        torch.cuda.synchronize()
-        torch_ua_bwd_start = time.time()
-        for _ in range(10):
-            torch_output.backward(do_torch, retain_graph=True) ## (b,h,r,l,d)
-        torch.cuda.synchronize()
-        torch_ua_bwd_end = time.time()
-
-        do = do_torch.clone().detach().requires_grad_(True)
-        do = do.transpose(1, 2)
-        do = torch.reshape(do, (do.shape[0], do.shape[1] * do.shape[2], do.shape[3], do.shape[4]))
+        do = torch.randn_like(sdpa_out).to(q.device)
 
         for _ in range(5):
             triton_output.backward(do, retain_graph=True)
@@ -512,20 +456,7 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         torch.cuda.synchronize()
         triton_ua_bwd_end = time.time()
 
-        do_flex = do_torch.clone().detach().requires_grad_(True)
-        do_flex = do_flex.transpose(1, 2)
-        do_flex = torch.reshape(do_flex, (do_flex.shape[0], do_flex.shape[1] * do_flex.shape[2], do_flex.shape[3], do_flex.shape[4]))
-
-        for _ in range(5):
-            out_flex.backward(do_flex, retain_graph=True)
-
-        torch.cuda.synchronize()
-        flex_ua_bwd_start = time.time()
-        for _ in range(10):
-            out_flex.backward(do_flex, retain_graph=True)
-        flex_ua_bwd_end = time.time()
-
-        do_sdpa = do_flex.clone().detach().requires_grad_(True)
+        do_sdpa = do.clone().detach().requires_grad_(True)
         for _ in range(5):
             sdpa_out.backward(do_sdpa, retain_graph=True)
 
@@ -536,17 +467,11 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         torch.cuda.synchronize()
         bwd_sdpa_end = time.time()
 
-        print(f'torch-ua-fwd: {fwd_ua_end-fwd_ua_start}')
         print(f'triton-ua-fwd: {fwd_triton_end-fwd_triton_start}')
-        print(f'torch-ua-bwd: {torch_ua_bwd_end-torch_ua_bwd_start}')
         print(f'triton-ua-bwd: {triton_ua_bwd_end-triton_ua_bwd_start}')
-        print(f'torch-fwd+bwd-ua: {(fwd_ua_end-fwd_ua_start)+(torch_ua_bwd_end-torch_ua_bwd_start)}')
-        print(f'flex-ua-fwd: {fwd_ua_flex_end-fwd_ua_flex_start}')
-        print(f'flex-ua-bwd: {flex_ua_bwd_end-flex_ua_bwd_start}')
         print(f'sdpa-ua-fwd: {fwd_sdpa_end-fwd_sdpa_start}')
         print(f'sdpa-ua-bwd: {bwd_sdpa_end-bwd_sdpa_start}')
         print(f'triton-fwd+bwd-ua: {(fwd_triton_end-fwd_triton_start)+(triton_ua_bwd_end-triton_ua_bwd_start)}')
-        print(f'flex-ua-fwd+bwd: {(fwd_ua_flex_end-fwd_ua_flex_start)+(flex_ua_bwd_end-flex_ua_bwd_start)}')
         print(f'sdpa-ua-fwd+bwd: {(fwd_sdpa_end-fwd_sdpa_start)+(bwd_sdpa_end-bwd_sdpa_start)}')
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
@@ -579,6 +504,10 @@ def test_case_universal_attention(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=Fa
     static_dest = torch.rand((BATCH, KV_H, N_CTX), dtype=dtype, device=device).sigmoid()
     static_dest.requires_grad_(True)
     _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=backward,causal=causal)
+    #k_affinity = k.clone().detach().requires_grad_(True)
+    #src_affinity = static_src.clone().detach().requires_grad_(True)
+    #dest_affinity = static_dest.clone().detach().requires_grad_(True)
+    #_debug_affinity_generation(k_affinity, src_affinity, dest_affinity)
 
 def profile_affinity_creation(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     ## This is a profiling pass, to ensure that we launch singular kernels only.
@@ -646,6 +575,9 @@ if __name__ == '__main__':
     #test_case_universal_attention(1, 1, 1, 1024, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 2048, 128, backward=True)
     #test_case_universal_attention(2, 1, 1, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 1, 2, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 1, 8, 2048, 128, backward=True)
+    #test_case_universal_attention(2, 2, 8, 2048, 128, backward=True)
     #test_case_universal_attention(1, 1, 32, 2048, 128, backward=True)
     #test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
     
@@ -662,6 +594,12 @@ if __name__ == '__main__':
     #test_case_universal_attention(2, 2, 16, 1024, 128, backward=True) 
     #test_case_universal_attention(4, 4, 8, 1024, 128, backward=True) 
     ## More custom configs to enhance Davis' experience in using this kernel. ##
+
+    #test_case_universal_attention(4, 4, 5, 4096, 64, backward=True) 
+    #test_case_universal_attention(4, 4, 5, 4096, 80, backward=True) 
+    #test_case_universal_attention(4, 4, 4, 4096, 64, backward=True) 
+    #test_case_universal_attention(4, 4, 4, 4096, 80, backward=True) 
+
     #test_case_universal_attention(4, 4, 5, 1024, 64, backward=True) 
     #test_case_universal_attention(4, 4, 4, 1024, 64, backward=True) 
     #test_case_universal_attention(4, 4, 4, 1024, 80, backward=True) 
@@ -672,6 +610,10 @@ if __name__ == '__main__':
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
     #speed_test_ua(2, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration.
     #speed_test_ua(4, 4, 8, 1024, 128, backward=True)  ## -> This is Llama 3.1-8bn's configuration that I am testing end-to-end.
+    #speed_test_ua(4, 4, 4, 2048, 64, backward=True)  
+    #speed_test_ua(4, 4, 4, 2048, 80, backward=True)  
+    #speed_test_ua(4, 4, 5, 2048, 80, backward=True)  
+    #speed_test_ua(4, 4, 5, 2048, 64, backward=True)  
 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
