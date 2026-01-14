@@ -104,12 +104,12 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         offseta_y += BLOCK_N
     return acc, l_i, m_i
 
-@triton.autotune(
-    configs=get_fwd_tune_config(),
-    key=['N_CTX', 'HEAD_DIM'],
-    restore_value=['desc_o', 'M'],
-    reset_to_zero=['desc_o', 'M']
-)
+#@triton.autotune(
+#    configs=get_fwd_tune_config(),
+#    key=['N_CTX', 'HEAD_DIM'],
+#    restore_value=['desc_o', 'M'],
+#    reset_to_zero=['desc_o', 'M']
+#)
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, desc_affinity,
@@ -298,12 +298,12 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
     return dq
 
 
-@triton.autotune(
-    configs=get_bwd_tune_config(),
-    key=['HEAD_DIM', 'stride_z'], 
-    restore_value=['DQ', 'DK', 'DV', 'DAFFINITY'],
-    reset_to_zero=['DQ', 'DK', 'DV', 'DAFFINITY']
-)
+#@triton.autotune(
+#    configs=get_bwd_tune_config(),
+#    key=['HEAD_DIM', 'stride_z'], 
+#    restore_value=['DQ', 'DK', 'DV', 'DAFFINITY'],
+#    reset_to_zero=['DQ', 'DK', 'DV', 'DAFFINITY']
+#)
 @triton.jit
 def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
               DO,  #
@@ -425,7 +425,7 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, static_src=None, static_dest=None, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, static_src=None, static_dest=None, warp_specialize=True, ac=False):
         assert causal, 'currently, only support causal-autoregressive style generation only.'
         #assert q.shape[2] > 0 and (q.shape[2] & (q.shape[2] - 1)) == 0, 'Currently only works for powers of 2. Trying to debug other paths. Masking is non-trivial'
         assert q.shape[2] % 128 == 0, 'Only works for multiples of 128!'
@@ -458,14 +458,17 @@ class _attention(torch.autograd.Function):
         desc_o = o
 
         ## Here, we launch an affinity matrix calculation kernel to simplify implementation. ##
-        desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
+        if ac:
+            desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
+        else:
+            with torch.enable_grad():
+                desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
         #desc_affinity = _affinity_fwd(k, static_src, static_dest)
 
         ## Specialize to this blk size for reasonable performance. ##
         BLOCK_M=128
         BLOCK_N=64
         grid = lambda META: (triton.cdiv(q.shape[2], META['BLOCK_M']), q.shape[0] * q.shape[1], 1)
-        #grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
         _attn_fwd[grid](
@@ -474,27 +477,33 @@ class _attention(torch.autograd.Function):
             desc_q, desc_k, desc_v, desc_o, desc_affinity,  #
             N_CTX=q.shape[2],  #
             HEAD_DIM=q.shape[-1],  #
-            #BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
-            #BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
+            BLOCK_M=BLOCK_M, # Comment out after debugging finishes.
+            BLOCK_N=BLOCK_N, # Comment out after debugging finishes.
             FP8_OUTPUT=False,
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             causal=causal,
             KV_H=KV_H,
             Q_H=Q_H,
-            #num_warps=8,
-            #num_stages=2,
+            num_warps=4 if HEAD_DIM_Q <= 64 else 8,
+            num_stages=4 if HEAD_DIM_Q <= 64 else 2,
             **extra_kern_args)
-
-        ctx.save_for_backward(q, k, v, o, M, static_src, static_dest)
+        if not ac:
+            ctx.save_for_backward(q, k, v, o, M, static_src, static_dest, desc_affinity)
+        else:
+            ctx.save_for_backward(q, k, v, o, M, static_src, static_dest)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        ctx.ac = ac
         return o[:, :, :, :HEAD_DIM_K]
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, o, M, static_src, static_dest = ctx.saved_tensors
+        if not ctx.ac:
+            q, k, v, o, M, static_src, static_dest, affinity = ctx.saved_tensors
+        else:
+            q, k, v, o, M, static_src, static_dest = ctx.saved_tensors
         do = do.contiguous()
         assert do.is_contiguous()
 
@@ -520,6 +529,8 @@ class _attention(torch.autograd.Function):
         NUM_WARPS, NUM_STAGES = 4, 3
         ## This is the true config that has passed correctness tests. ##
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
+        ## Optimised config. ##
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 32, 32, 32
         BLK_SLICE_FACTOR = 2
         PRE_BLOCK = 128
         Q_H = N_HEAD // k.shape[1]
@@ -533,10 +544,12 @@ class _attention(torch.autograd.Function):
             BATCH, N_HEAD, N_CTX,  #
             BLOCK_M=PRE_BLOCK, HEAD_DIM=do.shape[-1]  #
         )
-        ## Recompute affinity scores. ##
-
-        with torch.enable_grad():
-            affinity = _gen_affinity_scores(k, static_src, static_dest)
+        ## Recompute affinity scores only if activation checkpointing is ON. ##
+        if ctx.ac:
+            # Activation checkpointing ON: recompute affinity with gradient tracking
+            with torch.enable_grad():
+                affinity = _gen_affinity_scores(k, static_src, static_dest)
+        # else: affinity was already loaded from saved tensors with its computation graph intact
 
         ## This is the original code-path that uses the custom kernels for aff gen. ##
         #affinity = _affinity_fwd(k, static_src, static_dest)
@@ -550,13 +563,13 @@ class _attention(torch.autograd.Function):
             M, delta,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             Q_H, KV_H, N_CTX,  #
-            #BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
-            #BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
+            BLOCK_M1=BLOCK_M1, BLOCK_N1=BLOCK_N1,  #
+            BLOCK_M2=BLOCK_M2, BLOCK_N2=BLOCK_N2,  #
             BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,  #
             HEAD_DIM=do.shape[-1],  #
             causal=ctx.causal,
-            #num_warps=NUM_WARPS,  #
-            #num_stages=NUM_STAGES  #
+            num_warps=NUM_WARPS,  #
+            num_stages=NUM_STAGES  #
         )
         
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
@@ -567,6 +580,6 @@ class _attention(torch.autograd.Function):
         dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
 
         dk += dk_new
-        return dq[:, :, :, :ctx.HEAD_DIM], dk[:,:,:,:ctx.HEAD_DIM], dv[:,:,:,:ctx.HEAD_DIM], None, None, dsrc, ddest, None
+        return dq[:, :, :, :ctx.HEAD_DIM], dk[:,:,:,:ctx.HEAD_DIM], dv[:,:,:,:ctx.HEAD_DIM], None, None, dsrc, ddest, None, None
     
 attention = _attention.apply

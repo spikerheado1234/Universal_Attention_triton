@@ -415,64 +415,40 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     static_src_torch = torch.reshape(static_src, (static_src.shape[0], static_src.shape[1], n_, c_))
     static_dest_torch = torch.reshape(static_dest, (static_dest.shape[0], static_dest.shape[1], _n, _c))
 
+    sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
+
+    do = torch.randn_like(sdpa_out).to(q.device)
+    do_sdpa = do.clone().detach().requires_grad_(True)
+
     for _ in range(5):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
+        sdpa_out.backward(do_sdpa)
 
     torch.cuda.synchronize()
-    fwd_sdpa_start = time.time()
+    sdpa_start = time.time()
     for _ in range(10):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
+        sdpa_out.backward(do_sdpa)
     torch.cuda.synchronize()
-    fwd_sdpa_end = time.time()
+    sdpa_end = time.time()
 
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest)
+    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest, True, True)
     for _ in range(5):
         triton_output = fn()
+        triton_output.backward(do)
 
     torch.cuda.synchronize()
-    fwd_triton_start = time.time()
+    triton_start = time.time()
     for _ in range(10):
         triton_output = fn() 
+        triton_output.backward(do)
     torch.cuda.synchronize()
-    fwd_triton_end = time.time()
+    triton_end = time.time()
 
-    if backward:
-        q_torch.retain_grad()
-        k_torch.retain_grad()
-        v_torch.retain_grad()
-        static_src_torch.retain_grad()
-        static_dest_torch.retain_grad()
 
-        do = torch.randn_like(sdpa_out).to(q.device)
-
-        for _ in range(5):
-            triton_output.backward(do, retain_graph=True)
-
-        torch.cuda.synchronize()
-        triton_ua_bwd_start = time.time()
-        for _ in range(10):
-            triton_output.backward(do, retain_graph=True)
-        torch.cuda.synchronize()
-        triton_ua_bwd_end = time.time()
-
-        do_sdpa = do.clone().detach().requires_grad_(True)
-        for _ in range(5):
-            sdpa_out.backward(do_sdpa, retain_graph=True)
-
-        torch.cuda.synchronize()
-        bwd_sdpa_start = time.time()
-        for _ in range(10):
-            sdpa_out.backward(do_sdpa, retain_graph=True)
-        torch.cuda.synchronize()
-        bwd_sdpa_end = time.time()
-
-        print(f'triton-ua-fwd: {fwd_triton_end-fwd_triton_start}')
-        print(f'triton-ua-bwd: {triton_ua_bwd_end-triton_ua_bwd_start}')
-        print(f'sdpa-ua-fwd: {fwd_sdpa_end-fwd_sdpa_start}')
-        print(f'sdpa-ua-bwd: {bwd_sdpa_end-bwd_sdpa_start}')
-        print(f'triton-fwd+bwd-ua: {(fwd_triton_end-fwd_triton_start)+(triton_ua_bwd_end-triton_ua_bwd_start)}')
-        print(f'sdpa-ua-fwd+bwd: {(fwd_sdpa_end-fwd_sdpa_start)+(bwd_sdpa_end-bwd_sdpa_start)}')
+    print(f'triton-ua: {triton_end-triton_start}')
+    print(f'sdpa-ua: {sdpa_end-sdpa_start}')
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
@@ -568,7 +544,7 @@ if __name__ == '__main__':
     ##  4. N_CTX -> context length.
     ##  5. HEAD_DIM -> Should be power of two from 32 -> 128 only.
     ## All TCs passing. ##
-    test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
+    #test_case_universal_attention(1, 1, 1, 128, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 256, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 384, 128, backward=True)
     #test_case_universal_attention(1, 1, 1, 512, 128, backward=True)
@@ -613,7 +589,7 @@ if __name__ == '__main__':
     #speed_test_ua(4, 4, 4, 2048, 64, backward=True)  
     #speed_test_ua(4, 4, 4, 2048, 80, backward=True)  
     #speed_test_ua(4, 4, 5, 2048, 80, backward=True)  
-    #speed_test_ua(4, 4, 5, 2048, 64, backward=True)  
+    speed_test_ua(1, 4, 5, 4096, 64, backward=True)  
 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
