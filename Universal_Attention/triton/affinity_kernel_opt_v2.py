@@ -96,6 +96,8 @@ def _aff_fwd_kernel(
 
         tl.store(aff_ptr + offs_i[:, None] * str_aff_li + offs_j[None, :] * str_aff_lj, 
             affinity, mask=(offs_i[:, None] < L) & (offs_j[None, :] < L))
+        #tl.store(aff_ptr + offs_j[:, None] * str_aff_li + offs_i[None, :] * str_aff_lj, 
+        #    tl.trans(affinity), mask=(offs_j[:, None] < L) & (offs_i[None, :] < L))
 
 def _affinity_fwd(k, src, dest):
     '''
@@ -124,6 +126,7 @@ def _affinity_fwd(k, src, dest):
     )
 
     return aff.transpose(-1, -2).to(k.dtype).contiguous()
+    #return aff
 
 '''
 #######################################
@@ -329,7 +332,8 @@ def _affinity_bwd(k, src, dest, daff):
         daff_cs.stride(0), daff_cs.stride(1), daff_cs.stride(2), daff_cs.stride(3),       
         dk_i.stride(0), dk_i.stride(1), dk_i.stride(2), dk_i.stride(3), 
         dsrc.stride(0), dsrc.stride(1), dsrc.stride(2),  
-        B=b, H=h, L=l, D=d, BLOCK_D=d
+        B=b, H=h, L=l, D=d, BLOCK_D=d,
+        maxnreg=168,
     )
 
     grid_j = lambda META: (b, h, triton.cdiv(l, META['BLOCK_J']))

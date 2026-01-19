@@ -38,12 +38,13 @@ def supports_host_descriptor():
     return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 @torch.compile
-def _gen_affinity_scores(k, src, dest):
+def _gen_affinity_scores(k, src, dest, r):
     kkt = torch.einsum('bnqh, bnkh -> bnqk', k, k).relu().pow(2/3).float()
     affinity = kkt * src.pow(1/3).unsqueeze(-1) * dest.pow(1/3).unsqueeze(-2)
     affinity = torch.log1p(affinity.clamp(min=0, max=1-1e-6).neg())
     affinity = affinity.triu(1).cumsum(3)
-    return torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1.0e8), -1, -2).contiguous().to(k.dtype)
+    affinity = torch.transpose(affinity.masked_fill(torch.ones_like(affinity, dtype=torch.bool).tril(-1), -1.0e8), -1, -2).contiguous().to(k.dtype)
+    return affinity.repeat(1, r, 1, 1)
 
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -286,6 +287,8 @@ def _attn_bwd_dq(dq, q, K, V, AFFINITY,  #
         ds = ds.to(K.dtype.element_ty)
         ## Store to daffinity. ##
         tl.store(daffinity_ptrs, ds, mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
+        ## atomic_add code-path for fp32 semantics.
+        #tl.atomic_add(daffinity_ptrs, ds.to(tl.float32), mask=(offs_m[:, None] < N_CTX) & (offs_n[None, :] < N_CTX))
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         dq += tl.dot(ds, tl.trans(kT))
@@ -334,6 +337,8 @@ def _attn_bwd(Q, K, V, AFFINITY, sm_scale,  #
     DV += adj_KV
     AFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
     DAFFINITY += ((bhid // (KV_H * Q_H)) * ((Q_H * KV_H) * N_CTX * N_CTX) + (bhid % (KV_H * Q_H)) * (N_CTX * N_CTX)).to(tl.int64)
+    ## Use this if using fp32 atomic_add code-path. ##
+    #DAFFINITY += ((bhid // (KV_H * Q_H)) * (KV_H * N_CTX * N_CTX) + (bhid % (KV_H)) * (N_CTX * N_CTX)).to(tl.int64)
     ## Adjust these to batch dimension only since we need to loop through the "r" dimension for GQA. ##
     Q += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
     DO += ((bhid // (Q_H * KV_H)) * stride_z).to(tl.int64)
@@ -458,12 +463,7 @@ class _attention(torch.autograd.Function):
         desc_o = o
 
         ## Here, we launch an affinity matrix calculation kernel to simplify implementation. ##
-        if ac:
-            desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
-        else:
-            with torch.enable_grad():
-                desc_affinity = _gen_affinity_scores(k, static_src, static_dest)
-        #desc_affinity = _affinity_fwd(k, static_src, static_dest)
+        desc_affinity = _affinity_fwd(k, static_src, static_dest)
 
         ## Specialize to this blk size for reasonable performance. ##
         BLOCK_M=128
@@ -547,14 +547,16 @@ class _attention(torch.autograd.Function):
         ## Recompute affinity scores only if activation checkpointing is ON. ##
         if ctx.ac:
             # Activation checkpointing ON: recompute affinity with gradient tracking
-            with torch.enable_grad():
-                affinity = _gen_affinity_scores(k, static_src, static_dest)
+            #affinity = _gen_affinity_scores(k, static_src, static_dest)
+            affinity = _affinity_fwd(k, static_src, static_dest)
         # else: affinity was already loaded from saved tensors with its computation graph intact
 
         ## This is the original code-path that uses the custom kernels for aff gen. ##
         #affinity = _affinity_fwd(k, static_src, static_dest)
 
         daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
+        ## When using fp32 atomic_add semantics. ##
+        #daffinity = torch.zeros(affinity.shape[0], KV_H, N_CTX, N_CTX, dtype=torch.float32, device=affinity.device)
 
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
@@ -569,15 +571,14 @@ class _attention(torch.autograd.Function):
             HEAD_DIM=do.shape[-1],  #
             causal=ctx.causal,
             num_warps=NUM_WARPS,  #
-            num_stages=NUM_STAGES  #
+            num_stages=NUM_STAGES, #
+            maxnreg=168
         )
-        
+
         daffinity = torch.reshape(daffinity, (daffinity.shape[0], Q_H, KV_H, daffinity.shape[2], daffinity.shape[3])).sum(1, keepdim=False)
         
         ## This is the potentially buggy piece of code here to fix. ##
-        #dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
-
-        dk_new, dsrc, ddest = torch.autograd.grad(affinity, [k, static_src, static_dest], grad_outputs=daffinity)
+        dk_new, dsrc, ddest = _affinity_bwd(k, static_src, static_dest, daffinity)
 
         dk += dk_new
         return dq[:, :, :, :ctx.HEAD_DIM], dk[:,:,:,:ctx.HEAD_DIM], dv[:,:,:,:ctx.HEAD_DIM], None, None, dsrc, ddest, None, None

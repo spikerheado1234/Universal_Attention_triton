@@ -149,17 +149,14 @@ def ua_flex_attention(q, k, v, src, dest):
 def ua_sdpa(q, k, v, src, dest):
     if k.shape[1] != q.shape[1]:
         ## This is the GQA case. ##
-        k = k.repeat(1, q.shape[1]//k.shape[1], 1, 1)
-        v = v.repeat(1, q.shape[1]//v.shape[1], 1, 1)
-        src = src.repeat(1, q.shape[1]//src.shape[1], 1)
-        dest = dest.repeat(1, q.shape[1]//dest.shape[1], 1)
+        r = q.shape[1] // k.shape[1]
 
-    affs = GenAffTorch(k, src, dest)
+    affs = GenAffTorch(k, src, dest, r)
     torch.backends.cuda.enable_math_sdp(False)
     attn = F.scaled_dot_product_attention(
         q, 
-        k,
-        v,
+        k.repeat(1, r, 1, 1),
+        v.repeat(1, r, 1, 1),
         attn_mask=affs,
         scale=1,
     )  # b h l d
@@ -385,14 +382,6 @@ def _debug_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
         print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(k.grad), torch.nan_to_num(k_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(static_src.grad), torch.nan_to_num(static_src_sdpa.grad), atol=1e-2, rtol=1e-2)}')
         print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(static_dest.grad), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        dqc, dkc, dvc, dsrcc, ddestc = ua_bwd(q, k, v, static_src, static_dest, do)
-        print('-----ua_torch vs. sdpa version-------')
-        print(f'dq allclose-flex: {torch.allclose(torch.nan_to_num(dqc), torch.nan_to_num(q_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        print(f'dk allclose-flex: {torch.allclose(torch.nan_to_num(dkc), torch.nan_to_num(k_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        print(f'dv allclose-flex: {torch.allclose(torch.nan_to_num(dvc), torch.nan_to_num(v_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        print(f'dsrc allclose-flex: {torch.allclose(torch.nan_to_num(dsrcc), torch.nan_to_num(static_src_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        print(f'ddest allclose-flex: {torch.allclose(torch.nan_to_num(ddestc), torch.nan_to_num(static_dest_sdpa.grad), atol=1e-2, rtol=1e-2)}')
-        #helper_which_notclose(dvc, v_sdpa.grad, 1e-2, 1e-2)
 
 def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=False,causal=True):
     assert q.shape[2] % 16 == 0 and k.shape[2] % 16 == 0 and v.shape[2] % 16 == 0 and static_src.shape[2] % 16 == 0 and static_dest.shape[2] % 16 == 0, 'Seq length should be divisible by 16.' 
@@ -420,35 +409,40 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
     do = torch.randn_like(sdpa_out).to(q.device)
     do_sdpa = do.clone().detach().requires_grad_(True)
 
+    start_triton = torch.cuda.Event(enable_timing=True)
+    end_triton = torch.cuda.Event(enable_timing=True)
+    start_sdpa = torch.cuda.Event(enable_timing=True)
+    end_sdpa = torch.cuda.Event(enable_timing=True)
     for _ in range(5):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
         sdpa_out.backward(do_sdpa)
 
     torch.cuda.synchronize()
-    sdpa_start = time.time()
+    start_sdpa.record()
     for _ in range(10):
         sdpa_out = ua_sdpa(q_sdpa, k_sdpa, v_sdpa, static_src_sdpa, static_dest_sdpa)
         sdpa_out.backward(do_sdpa)
+    end_sdpa.record()
+
     torch.cuda.synchronize()
-    sdpa_end = time.time()
+
 
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest, True, True)
+    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest, True, False)
     for _ in range(5):
         triton_output = fn()
         triton_output.backward(do)
 
     torch.cuda.synchronize()
-    triton_start = time.time()
+    start_triton.record()
     for _ in range(10):
         triton_output = fn() 
         triton_output.backward(do)
+    end_triton.record()
     torch.cuda.synchronize()
-    triton_end = time.time()
 
-
-    print(f'triton-ua: {triton_end-triton_start}')
-    print(f'sdpa-ua: {sdpa_end-sdpa_start}')
+    print(f'triton-ua: {start_triton.elapsed_time(end_triton)}')
+    print(f'sdpa-ua: {start_sdpa.elapsed_time(end_sdpa)}')
 
 def test_case(BATCH, Q_H, KV_H, N_CTX, HEAD_DIM, backward=False):
     print(f'--------test_case BATCH={BATCH} Q_H={Q_H} KV_H={KV_H} N_CTX={N_CTX} HEAD_DIM={HEAD_DIM}---------')
@@ -556,6 +550,7 @@ if __name__ == '__main__':
     #test_case_universal_attention(2, 2, 8, 2048, 128, backward=True)
     #test_case_universal_attention(1, 1, 32, 2048, 128, backward=True)
     #test_case_universal_attention(2, 1, 32, 2048, 128, backward=True) 
+    #test_case_universal_attention(8, 4, 4, 4096, 64, backward=True)  ## This is the input we have to figure out where perf has vanished on.
     
     ## Longer sequence tests, need to reduce number of heads for this. ##
     #test_case_universal_attention(1, 1, 16, 4096, 128, backward=True) 
@@ -589,7 +584,11 @@ if __name__ == '__main__':
     #speed_test_ua(4, 4, 4, 2048, 64, backward=True)  
     #speed_test_ua(4, 4, 4, 2048, 80, backward=True)  
     #speed_test_ua(4, 4, 5, 2048, 80, backward=True)  
-    speed_test_ua(1, 4, 5, 4096, 64, backward=True)  
+    #speed_test_ua(1, 4, 5, 4096, 64, backward=True)  
+
+    speed_test_ua(8, 4, 4, 4096, 64, backward=True)  # The important config to test on.
+    #speed_test_ua(8, 4, 4, 4096, 80, backward=True)  # The important config to test on.
+    #speed_test_ua(8, 4, 4, 4096, 128, backward=True)  # The important config to test on.
 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
