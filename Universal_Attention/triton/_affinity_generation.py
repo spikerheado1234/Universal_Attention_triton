@@ -13,7 +13,8 @@ configs = [
 
 # Optimal config tuned on A100
 fwd_A100 = [triton.Config({'BLOCK_I': 16, 'BLOCK_J': 128}, num_stages=2, num_warps=4)]
-bwd_A100 = [triton.Config({'BLOCK_I': 16, 'BLOCK_J': 32}, num_stages=2, num_warps=2)]
+#bwd_A100 = [triton.Config({'BLOCK_I': 16, 'BLOCK_J': 32}, num_stages=2, num_warps=2)]
+bwd_A100 = [triton.Config({'BLOCK_I': 64, 'BLOCK_J': 16}, num_stages=2, num_warps=4)]
 bwd_col_A100 = [triton.Config({'BLOCK_I': 64, 'BLOCK_J': 32}, num_stages=2, num_warps=2)]
 
 '''

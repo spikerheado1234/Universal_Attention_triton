@@ -10,7 +10,7 @@ import time
 from torch.nn.attention.flex_attention import flex_attention
 from affinity_kernel import _gen_affinity_scores as AffKern
 from affinity_kernel_opt import _gen_affinity_scores as AffKernOpt
-from affinity_kernel_opt_v2 import _gen_affinity_scores as AffKernOptV2, _affinity_fwd, _affinity_bwd
+from _affinity_generation import _gen_affinity_scores as AffKernOptV2, _affinity_fwd, _affinity_bwd
 
 def sdpa_torch(q, k, v, causal=False):
     """

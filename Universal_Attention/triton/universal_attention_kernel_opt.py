@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import torch.nn.functional as F
-from affinity_kernel_opt_v2 import _affinity_bwd, _affinity_fwd
+from _affinity_generation import _affinity_bwd, _affinity_fwd
 
 def get_fwd_tune_config():
     configs = []
@@ -547,16 +547,9 @@ class _attention(torch.autograd.Function):
         ## Recompute affinity scores only if activation checkpointing is ON. ##
         if ctx.ac:
             # Activation checkpointing ON: recompute affinity with gradient tracking
-            #affinity = _gen_affinity_scores(k, static_src, static_dest)
             affinity = _affinity_fwd(k, static_src, static_dest)
-        # else: affinity was already loaded from saved tensors with its computation graph intact
-
-        ## This is the original code-path that uses the custom kernels for aff gen. ##
-        #affinity = _affinity_fwd(k, static_src, static_dest)
 
         daffinity = torch.zeros(affinity.shape[0], Q_H * KV_H, N_CTX, N_CTX, dtype=affinity.dtype, device=affinity.device)
-        ## When using fp32 atomic_add semantics. ##
-        #daffinity = torch.zeros(affinity.shape[0], KV_H, N_CTX, N_CTX, dtype=torch.float32, device=affinity.device)
 
         grid = (triton.cdiv(N_CTX, BLOCK_N1), 1, BATCH * N_HEAD)
         scale = 1.0 / ctx.HEAD_DIM**0.5
