@@ -563,7 +563,7 @@ if __name__ == '__main__':
     #test_case_universal_attention(1, 2, 16, 2048, 128, backward=True)
     #test_case_universal_attention(2, 2, 16, 2048, 128, backward=True) 
     #test_case_universal_attention(2, 2, 16, 1024, 128, backward=True) 
-    test_case_universal_attention(8, 4, 4, 4096, 128, backward=True) 
+    #test_case_universal_attention(8, 4, 4, 4096, 128, backward=True) 
     ## More custom configs to enhance Davis' experience in using this kernel. ##
 
     #test_case_universal_attention(4, 4, 5, 4096, 64, backward=True) 
@@ -588,7 +588,7 @@ if __name__ == '__main__':
 
     #speed_test_ua(8, 4, 4, 4096, 64, backward=True)  # The important config to test on.
     #speed_test_ua(8, 4, 4, 4096, 80, backward=True)  # The important config to test on.
-    #speed_test_ua(8, 4, 4, 4096, 128, backward=True)  # The important config to test on.
+    speed_test_ua(8, 4, 4, 4096, 128, backward=True)  # The important config to test on.
 
     #speed_test_ua(2, 1, 32, 1024, 128, backward=True) 
 
