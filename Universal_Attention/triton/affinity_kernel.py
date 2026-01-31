@@ -1,7 +1,6 @@
 import torch
 from torch.autograd import Function
 import torch.nn.functional as F
-import nvtx
 
 import triton
 import triton.language as tl
