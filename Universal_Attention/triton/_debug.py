@@ -428,7 +428,7 @@ def _speed_triton_universal_attention(q,k,v,static_src,static_dest,backward=Fals
 
 
     sm_scale = 1.3
-    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest, True, False)
+    fn = lambda: attention(q, k, v, causal, sm_scale, static_src, static_dest, True, True)
     for _ in range(5):
         triton_output = fn()
         triton_output.backward(do)
