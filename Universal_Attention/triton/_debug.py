@@ -8,6 +8,7 @@ from universal_attention_kernel import universal_attention_forward
 from math import ceil
 import time
 from torch.nn.attention.flex_attention import flex_attention
+import torch.profiler
 from affinity_kernel import _gen_affinity_scores as AffKern
 from affinity_kernel_opt import _gen_affinity_scores as AffKernOpt
 from _affinity_generation import _gen_affinity_scores as AffKernOptV2, _affinity_fwd, _affinity_bwd
@@ -586,7 +587,18 @@ if __name__ == '__main__':
     #speed_test_ua(4, 4, 5, 2048, 80, backward=True)  
     #speed_test_ua(1, 4, 5, 4096, 64, backward=True)  
 
-    speed_test_ua(8, 4, 4, 4096, 64, backward=True)  # The important config to test on.
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True, # Optional: record tensor shapes
+        profile_memory=True, # Optional: profile memory usage
+        with_stack=True, # Optional: collect stack traces
+    ) as prof:
+        speed_test_ua(8, 4, 4, 4096, 64, backward=True)  # The important config to test on.
+
+    prof.export_chrome_trace('custom_kernel_sdpa_trace.json')
     #speed_test_ua(8, 4, 4, 4096, 80, backward=True)  # The important config to test on.
     #speed_test_ua(8, 4, 4, 4096, 128, backward=True)  # The important config to test on.
 
