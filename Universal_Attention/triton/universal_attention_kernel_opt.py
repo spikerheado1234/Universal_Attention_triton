@@ -529,7 +529,7 @@ class _attention(torch.autograd.Function):
         dv = torch.empty_like(v)
         BATCH, N_HEAD, N_CTX = q.shape[:3]
         PRE_BLOCK = 128
-        NUM_WARPS, NUM_STAGES = 4, 3
+        NUM_WARPS, NUM_STAGES = 4, 2
         ## This is the true config that has passed correctness tests. ##
         BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 64, 64, 32
         ## Optimised config. ##
